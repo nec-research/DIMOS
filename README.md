@@ -4,9 +4,10 @@ DIMOS (Differentiable Molecular Simulations) is a PyTorch-powered framework for 
 
 Documentation available at: https://henrik-christiansen.de/dimos
 
-## Installation
+Please cite our preprint if you are using DIMOS: 
+H. Christiansen, T. Maruyama, F. Errica, V. Zaverkin, M. Takamoto, and F. Alesiani, Fast, Modular, and Differentiable Framework for Machine Learning-Enhanced Molecular Simulations, [arXiv:2503.20541](https://arxiv.org/pdf/2503.20541) (2025). 
 
-For this, first clone the repo to a local folder.
+## Installation
 
 We recommend setting up a new python environment, for example like this (using Python 3.10 because DIMOS is tested on this version):
 
