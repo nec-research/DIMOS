@@ -647,7 +647,7 @@ class NeighborHandling():
         # get count of how many atoms are in in cell
         cell_counts = torch.bincount(linear_cell_indices, minlength=self.total_num_cells)
         max_atoms_in_cell = cell_counts.max()
-        if self.cell_capacity_for_atoms != max_atoms_in_cell:
+        if (self.cell_capacity_for_atoms != max_atoms_in_cell) or (self.total_num_cells != self._cell_atoms_buffer.shape[0]):
             self.cell_capacity_for_atoms = max_atoms_in_cell
             self._cell_atoms_buffer = torch.full((self.total_num_cells, self.cell_capacity_for_atoms), -1, dtype=torch.int64)
         else:

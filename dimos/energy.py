@@ -1242,7 +1242,8 @@ class LennardJones(CommonNonBonded):
             scnb: torch.Tensor,
             exclusions_one_four: torch.Tensor,
             periodic: bool,
-            box: torch.Tensor):
+            box: torch.Tensor,
+            combining_rule="lorentz-berthelot"):
         """Initialize Lennard-Jones potential.
 
         Parameters
@@ -1274,6 +1275,10 @@ class LennardJones(CommonNonBonded):
         self.box = box
 
         self.exclusions_one_four = exclusions_one_four
+
+        self.combining_rule = combining_rule
+        if self.combining_rule == "lorentz-berthelot":
+            self.combining_rule = "arithmetric"
 
     def __str__(self):
         """Return name of potential.
@@ -1314,7 +1319,11 @@ class LennardJones(CommonNonBonded):
         rinv12 = rinv6 * rinv6
 
         epsilon_pairs = torch.sqrt(self.epsilons[neighborlist[0]] * self.epsilons[neighborlist[1]])
-        sigma_pairs_six = (0.5 * (self.sigmas[neighborlist[0]] + self.sigmas[neighborlist[1]]))**6
+
+        if self.combining_rule == "arithmetric":
+            sigma_pairs_six = (0.5 * (self.sigmas[neighborlist[0]] + self.sigmas[neighborlist[1]]))**6
+        if self.combining_rule == "geometric":
+            sigma_pairs_six = (self.sigmas[neighborlist[0]] * self.sigmas[neighborlist[1]])**3
 
         bb = 4.0 * epsilon_pairs * sigma_pairs_six
         aa = bb * sigma_pairs_six
@@ -1357,11 +1366,13 @@ class LennardJones(CommonNonBonded):
         rinv2 = inverse_dist * inverse_dist
         rinv6 = rinv2 * rinv2 * rinv2
         rinv12 = rinv6 * rinv6
-
         epsilon_pairs = torch.sqrt(
             self.epsilons[self.exclusions_one_four[0]] * self.epsilons[self.exclusions_one_four[1]])
-        sigma_pairs_six = (
-            0.5 * (self.sigmas[self.exclusions_one_four[0]] + self.sigmas[self.exclusions_one_four[1]]))**6
+        
+        if self.combining_rule == "arithmetric":
+            sigma_pairs_six = (0.5 * (self.sigmas[self.exclusions_one_four[0]] + self.sigmas[self.exclusions_one_four[1]]))**6
+        if self.combining_rule == "geometric":
+            sigma_pairs_six = (self.sigmas[self.exclusions_one_four[0]] * self.sigmas[self.exclusions_one_four[1]])**3
 
         aa = 4 * epsilon_pairs * sigma_pairs_six * sigma_pairs_six
         bb = 4 * epsilon_pairs * sigma_pairs_six

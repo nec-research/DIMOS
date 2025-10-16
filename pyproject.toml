@@ -8,7 +8,7 @@ py-modules = ["dimos"]
 [project]
 name = "dimos"
 version = "0.1"
-description = "Differentiable Molecular Simulator"
+description = "DIMOS: DIfferentiable MOlecular Simulator"
 authors = [ { name="Henrik Christiansen", email="henrik.christiansen@neclab.eu" },
             { name="Takashi Maruyama", email="takashi.maruyama@neclab.eu" },
             { name="Federico Errica", email="federico.errica@neclab.eu" },
@@ -22,10 +22,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10"
 
 dependencies = [
-    "torch>=2.4.1,<2.6.0",
+    "torch>=2.4.1",
     "ParmEd>=4.2.2",
     "numpy<2.0.0",
 ]
@@ -48,7 +48,7 @@ mmtools = [
 ]
 
 mace = [
-    "mace-torch",
+    "mace-torch<=0.3.11",
     "cuequivariance-ops-torch-cu12",
 ]
 
@@ -58,4 +58,4 @@ orb = [
 ]
 
 [project.urls]
-"Homepage" = "https://henrik-christiansen.de/dimos"
+"Homepage" = "https://dimos.henrik-christiansen.net"

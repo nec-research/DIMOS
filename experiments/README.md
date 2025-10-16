@@ -1,0 +1,1 @@
+This directory contains two experiments: `dimos_hmc.py` which reproduces the HMC optimization as presented in the manuscript (using the arguments `1 movement_heavy` to train the parameters), and the Jupyter notebook `homopolymer_in_solvent.ipynb` that implements the collapse of a (homo) polymer from scratch, with and without solvent.

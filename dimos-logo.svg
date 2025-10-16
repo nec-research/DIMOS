@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="150"
+   height="56"
+   viewBox="0 0 150 56"
+   version="1.1"
+   id="svg13"
+   sodipodi:docname="dimos-logo.svg"
+   inkscape:version="1.4.2 (f4327f4, 2025-05-13)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs13" />
+  <sodipodi:namedview
+     id="namedview13"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="6.04"
+     inkscape:cx="113.07947"
+     inkscape:cy="12.996689"
+     inkscape:window-width="2560"
+     inkscape:window-height="1369"
+     inkscape:window-x="-8"
+     inkscape:window-y="-8"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg13" />
+  <!-- Background (optional) -->
+  <!-- <rect width="200" height="60" fill="#f8f9fa" rx="5"/> -->
+  <!-- Letter D -->
+  <text
+     x="10"
+     y="40"
+     font-family="Arial, sans-serif"
+     font-size="36px"
+     font-weight="bold"
+     fill="#2c3e50"
+     id="text1"
+     style="fill:#535a6e;fill-opacity:1">D</text>
+  <!-- Letter I -->
+  <text
+     x="37.539062"
+     y="40"
+     font-family="Arial, sans-serif"
+     font-size="36px"
+     font-weight="bold"
+     fill="#2c3e50"
+     id="text2"
+     style="fill:#535a6e;fill-opacity:1">I</text>
+  <!-- Letter M -->
+  <text
+     x="50"
+     y="40"
+     font-family="Arial, sans-serif"
+     font-size="36px"
+     font-weight="bold"
+     fill="#2c3e50"
+     id="text3"
+     style="fill:#535a6e;fill-opacity:1">M</text>
+  <!-- Molecular structure replacing O -->
+  <g
+     transform="translate(97.748344,27.019867)"
+     id="g12">
+    <!-- Central atom -->
+    <!-- Surrounding atoms -->
+    <!-- Bonds -->
+    <line
+       x1="0"
+       y1="0"
+       x2="-12"
+       y2="-8"
+       stroke="#34495e"
+       stroke-width="2"
+       id="line7" />
+    <circle
+       cx="-12"
+       cy="-8"
+       r="3"
+       fill="#3498db"
+       stroke="#2980b9"
+       stroke-width="1"
+       id="circle4" />
+    <line
+       x1="0"
+       y1="0"
+       x2="12"
+       y2="-8"
+       stroke="#34495e"
+       stroke-width="2"
+       id="line8" />
+    <circle
+       cx="12"
+       cy="-8"
+       r="3"
+       fill="#3498db"
+       stroke="#2980b9"
+       stroke-width="1"
+       id="circle5" />
+    <line
+       x1="0"
+       y1="0"
+       x2="-12"
+       y2="8"
+       stroke="#34495e"
+       stroke-width="2"
+       id="line9" />
+    <circle
+       cx="-12"
+       cy="8"
+       r="3"
+       fill="#27ae60"
+       stroke="#229954"
+       stroke-width="1"
+       id="circle6" />
+    <line
+       x1="0"
+       y1="0"
+       x2="12"
+       y2="8"
+       stroke="#34495e"
+       stroke-width="2"
+       id="line10" />
+    <circle
+       cx="12"
+       cy="8"
+       r="3"
+       fill="#27ae60"
+       stroke="#229954"
+       stroke-width="1"
+       id="circle7" />
+    <!-- Additional smaller atoms for complexity -->
+    <!-- Additional bonds -->
+    <line
+       x1="0"
+       y1="0"
+       x2="0"
+       y2="-15"
+       stroke="#34495e"
+       stroke-width="1.5"
+       id="line11" />
+    <circle
+       cx="0"
+       cy="-15"
+       r="2"
+       fill="#f39c12"
+       stroke="#e67e22"
+       stroke-width="1"
+       id="circle10" />
+    <line
+       x1="0"
+       y1="0"
+       x2="0"
+       y2="15"
+       stroke="#34495e"
+       stroke-width="1.5"
+       id="line12" />
+    <circle
+       cx="0"
+       cy="0"
+       r="4"
+       fill="#e74c3c"
+       stroke="#c0392b"
+       stroke-width="1"
+       id="circle3" />
+    <circle
+       cx="0"
+       cy="15"
+       r="2"
+       fill="#f39c12"
+       stroke="#e67e22"
+       stroke-width="1"
+       id="circle11" />
+  </g>
+  <!-- Letter S -->
+  <text
+     x="115"
+     y="40"
+     font-family="Arial, sans-serif"
+     font-size="36px"
+     font-weight="bold"
+     fill="#2c3e50"
+     id="text12"
+     style="fill:#535a6e;fill-opacity:1">S</text>
+  <!-- Subtitle -->
+  <!-- Optional accent line -->
+  <line
+     x1="9.8344374"
+     y1="46.903973"
+     x2="139.13908"
+     y2="46.903973"
+     stroke="#e74c3c"
+     stroke-width="1.01707"
+     opacity="0.3"
+     id="line13"
+     style="fill:#0f1ed2;fill-opacity:1;stroke:#0f1ed2;stroke-opacity:1" />
+</svg>
