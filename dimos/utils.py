@@ -538,10 +538,12 @@ def periodic_correction(vectors, box):
     torch.Tensor
         Corrected vectors.
     """
+    if box is None:
+        return vectors
     return vectors - box * torch.floor(vectors / box + 0.5)
 
 
-def get_dihedral_angle(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box):
+def get_dihedral_angle_3d(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box):
     """
     Calculate dihedral angles between sets of four atoms.
 
@@ -565,6 +567,7 @@ def get_dihedral_angle(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box
     torch.Tensor
         Dihedral angles in radians.
     """
+
     v1 = get_distance_vectors(pos, edge_list_1, periodic, box)
     v2 = get_distance_vectors(pos, edge_list_2, periodic, box)
     v3 = get_distance_vectors(pos, edge_list_3, periodic, box)
@@ -582,7 +585,120 @@ def get_dihedral_angle(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box
     cos_phi = torch.linalg.vecdot(crossv1, normcrossv2) / normv1
     sin_phi = torch.linalg.vecdot(crossv3, normcrossv2) / normv3
     phi = -torch.atan2(sin_phi, cos_phi)
+
     return phi
+
+def get_dihedral_angle_nd(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box, eps=1e-9): #Check if this is called directly!!!
+    """
+    Dimension-agnostic dihedral angle (works for d >= 3).
+    Reduces to the 3D formula when extra coordinates are zero.
+    
+    Projects the bond vectors into a local 3D subspace and applies the standard
+    cross-product formula. The orientation of the local frame is fixed by
+    ensuring consistency with the 3D projection's handedness.
+
+    Parameters
+    ----------
+    pos : (n_atoms, d) torch.Tensor
+    edge_list_1/2/3 : (N, 2) torch.LongTensor
+        Consecutive edges forming three bond vectors b1, b2, b3.
+    periodic : bool
+    box : torch.Tensor
+        Passed through to get_distance_vectors.
+
+    Returns
+    -------
+    phi : (N,) torch.Tensor
+        Signed torsion angles in radians in (-pi, pi].
+    """
+
+    v1 = get_distance_vectors(pos, edge_list_1, periodic, box)  # (N, d)
+    v2 = get_distance_vectors(pos, edge_list_2, periodic, box)  # (N, d)
+    v3 = get_distance_vectors(pos, edge_list_3, periodic, box)  # (N, d)
+
+    # Build orthonormal basis for the 3D subspace spanned by v1, v2, v3
+    # using Gram-Schmidt orthogonalization
+    
+    # e1: normalize v1
+    e1 = v1.clone()
+    e1_norm = torch.linalg.vector_norm(e1, dim=1, keepdim=True).clamp_min(eps)
+    e1 = e1 / e1_norm
+    
+    # e2: orthogonalize v2 against e1, then normalize
+    e2 = v2 - (v2 * e1).sum(dim=1, keepdim=True) * e1
+    e2_norm = torch.linalg.vector_norm(e2, dim=1, keepdim=True).clamp_min(eps)
+    e2 = e2 / e2_norm
+    
+    # e3: orthogonalize v3 against e1 and e2
+    e3_raw = v3 - (v3 * e1).sum(dim=1, keepdim=True) * e1 - (v3 * e2).sum(dim=1, keepdim=True) * e2
+    e3_norm = torch.linalg.vector_norm(e3_raw, dim=1, keepdim=True)
+
+    # Use the actual orthogonal residual as the third basis vector. Normalize it.
+    # The residual direction fixes the local sign ambiguity for the angle, but the
+    # final dihedral sign must still account for the handedness of the local 3D
+    # basis in the ambient N-dimensional space.
+    e3 = torch.where(
+        e3_norm > 1e-12,
+        e3_raw / e3_norm.clamp_min(eps),
+        e3_raw.new_zeros(e3_raw.shape)
+    )
+
+    # Determine the orientation of the local basis (e1, e2, e3) via QR.
+    # This gives a stable ±1 handedness flag for the projected 3D subspace.
+    local_basis = torch.stack((e1, e2, e3), dim=1).transpose(1, 2)  # shape (N, d, 3)
+    _, R = torch.linalg.qr(local_basis, mode="reduced")
+    signR = torch.sign(torch.det(R))
+    signR = torch.where(torch.isclose(signR, torch.tensor(0.0, device=signR.device, dtype=signR.dtype)), torch.ones_like(signR), signR)
+
+    def project_to_local_frame(vectors):
+        # vectors: (N, d), local_basis: (N, d, 3)
+        # The result is a batched dot product of each vector with each basis axis.
+        return torch.bmm(vectors.unsqueeze(1), local_basis).squeeze(1)
+
+    v1_local = project_to_local_frame(v1)
+    v2_local = project_to_local_frame(v2)
+    v3_local = project_to_local_frame(v3)
+
+    # Apply the standard 3D dihedral formula with cross products
+    crossv1 = torch.linalg.cross(v1_local, v2_local, dim=1)
+    crossv2 = torch.linalg.cross(v2_local, v3_local, dim=1)
+    crossv3 = torch.linalg.cross(v2_local, crossv1, dim=1)
+
+    normv1 = torch.linalg.vector_norm(crossv1, dim=1).clamp_min(eps)
+    normv2 = torch.linalg.vector_norm(crossv2, dim=1).clamp_min(eps)
+    normv3 = torch.linalg.vector_norm(crossv3, dim=1).clamp_min(eps)
+
+    normcrossv2 = crossv2 / normv2.unsqueeze(1)
+
+    cos_phi = torch.linalg.vecdot(crossv1, normcrossv2) / normv1
+    sin_phi = torch.linalg.vecdot(crossv3, normcrossv2) / normv3
+    phi = -signR * torch.atan2(sin_phi, cos_phi)
+
+    return phi
+
+
+def get_dihedral_angle(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box, method=None):
+    """
+    Calculate dihedral angles, automatically choosing 3D or N-D implementation.
+    
+    For hyperspatial simulations (d > 3), uses the N-dimensional formula that
+    properly handles atoms moving in extra dimensions.
+    
+    """
+
+    # For hyperspatial simulations (pos dimensionality > 3) use the
+    # dimension-agnostic implementation which preserves sign and orientation
+    # information that would be lost by naively projecting into 3D.
+    if pos.size(1) > 3:
+        if box is None:
+            return get_dihedral_angle_3d(pos[:,:3], edge_list_1, edge_list_2, edge_list_3, periodic, None)
+        else:
+            return get_dihedral_angle_3d(pos[:,:3], edge_list_1, edge_list_2, edge_list_3, periodic, box[:3])
+    # Fallback: 3D positions use the standard 3D implementation.
+    if box is None:
+        return get_dihedral_angle_3d(pos, edge_list_1, edge_list_2, edge_list_3, periodic, None)
+    else:
+        return get_dihedral_angle_3d(pos, edge_list_1, edge_list_2, edge_list_3, periodic, box)
 
 
 def maxwell_boltzmann_distr(sys, vel, temperature, generator=None, selection=None):
@@ -713,6 +829,8 @@ def package_path(*paths, package_directory=os.path.dirname(os.path.abspath(__fil
     str
         Absolute path within package directory.
     """
+    # Strip away leading / to avoid issues with os.path.join
+    paths = [p.lstrip("/") for p in paths]
     return os.path.join(package_directory, *paths)
 
 
@@ -732,4 +850,19 @@ def project_path(*paths, project_directory=os.path.dirname(os.path.dirname(os.pa
     str
         Absolute path within project directory.
     """
+    paths = [p.lstrip("/") for p in paths]
     return os.path.join(project_directory, *paths)
+
+
+class netCDF_file_wrapper():
+    def __init__(self):
+        self.netcdf_traj = {}
+
+    def write(self, parameter_set_parmed, output_file, coordinates):
+        if output_file.name not in self.netcdf_traj.keys():
+            temp_file = parmed.amber.NetCDFTraj(output_file.name, "w")
+            self.netcdf_traj[output_file.name] = temp_file.open_new(output_file.name, len(coordinates), box=True)
+
+            self.netcdf_traj[output_file.name].add_box(parameter_set_parmed.box[:3], parameter_set_parmed.box[3:])
+            self.netcdf_traj[output_file.name].add_coordinates(coordinates)
+

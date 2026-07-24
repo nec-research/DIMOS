@@ -665,7 +665,8 @@ class Verlet(CommonIntegrator):
         sys : object
             The system object containing force field information.
         """
-        self.a = sys.calc_energy(pos, neighborlist, return_forces=True)[2].to(self.dtype)
+        self.e, self.f, self.a = sys.calc_energy(pos, neighborlist, return_forces=True)
+        self.a.to(self.dtype)
 
     def get_variables_to_detach(self):
         """
@@ -676,7 +677,7 @@ class Verlet(CommonIntegrator):
         list
             A list containing the acceleration tensor.
         """
-        return [self.a]
+        return [self.e, self.f, self.a]
 
     def step(self, pos, vel, neighborlist, sys, generator=None):
         """
@@ -890,7 +891,8 @@ class VelocityVerlet(CommonIntegrator):
         sys : object
             The system object containing force field information.
         """
-        self.a = sys.calc_energy(pos, neighborlist, return_forces=True)[2].to(self.dtype)
+        self.e, self.f, self.a = sys.calc_energy(pos, neighborlist, return_forces=True)
+        self.a.to(self.dtype)
 
     def get_variables_to_detach(self):
         """
@@ -901,7 +903,7 @@ class VelocityVerlet(CommonIntegrator):
         list
             A list containing the acceleration tensor.
         """
-        return [self.a]
+        return [self.e, self.f, self.a]
 
     def step(self, pos, vel, neighborlist, sys, generator=None):
         """
@@ -1026,9 +1028,9 @@ class BrownianDynamics(CommonIntegrator):
         self.temperature = temperature
         self.friction = friction * constants.FS_TO_INTERNAL
         self.noise_amplitude = math.sqrt(2.0 * constants.BOLTZMANN * self.temperature * self.timestep / self.friction)
-        self.sqrt_one_over_masses = torch.sqrt(1.0 / sys.masses).unsqueeze(-1).expand(-1, 3)
+        self.sqrt_one_over_masses = torch.sqrt(1.0 / sys.masses).unsqueeze(-1).expand(-1, sys.dim)
         self.force_scale = self.timestep / self.friction
-        self.stored_tensor_for_random_numbers = torch.empty((sys.num_atoms, 3))
+        self.stored_tensor_for_random_numbers = torch.empty((sys.num_atoms, sys.dim))
 
         if not isinstance(self.constraint_handler, PassthroughConstraintHandling):
             raise NotImplementedError("For Brownian Dynamics, constraints are not implemented.")
@@ -1042,7 +1044,7 @@ class BrownianDynamics(CommonIntegrator):
         list
             An empty list as Brownian Dynamics doesn't store persistent tensors.
         """
-        return []
+        return [self.e, self.f, self.a]
 
     def step(self, pos, vel, neighborlist, sys, generator=None):
         """
@@ -1071,7 +1073,8 @@ class BrownianDynamics(CommonIntegrator):
         tuple
             The updated positions and velocities.
         """
-        self.a = sys.calc_energy(pos, neighborlist, return_forces=True)[2].to(self.dtype)
+        self.e, self.f, self.a = sys.calc_energy(pos, neighborlist, return_forces=True)
+        self.a.to(self.dtype)
 
         original_pos = pos.clone()
         pos = pos + self.force_scale * self.a + self.noise_amplitude * self.sqrt_one_over_masses * \
@@ -1159,8 +1162,8 @@ class LangevinDynamics(CommonIntegrator):
         self.kBT = constants.BOLTZMANN * self.temperature
         self.friction = friction * constants.FS_TO_INTERNAL
         self.vel_scale = math.exp(-self.friction * self.timestep)
-        self.noise_amplitude = torch.sqrt(self.kBT * (1 - self.vel_scale**2) / sys.masses).unsqueeze(-1).expand(-1, 3)
-        self.stored_tensor_for_random_numbers = torch.empty((sys.num_atoms, 3))
+        self.noise_amplitude = torch.sqrt(self.kBT * (1 - self.vel_scale**2) / sys.masses).unsqueeze(-1).expand(-1, sys.dim)
+        self.stored_tensor_for_random_numbers = torch.empty((len(sys.masses), sys.dim))
 
         if not isinstance(self.constraint_handler, PassthroughConstraintHandling):
             raise NotImplementedError("For Langevin Dynamics, constraints are not implemented.")
@@ -1180,7 +1183,8 @@ class LangevinDynamics(CommonIntegrator):
         sys : object
             The system object containing force field information.
         """
-        self.a = sys.calc_energy(pos, neighborlist, return_forces=True)[2].to(self.dtype)
+        self.e, self.f, self.a = sys.calc_energy(pos, neighborlist, return_forces=True)
+        self.a.to(self.dtype)
 
     def get_variables_to_detach(self):
         """
@@ -1191,7 +1195,7 @@ class LangevinDynamics(CommonIntegrator):
         list
             A list containing the acceleration tensor.
         """
-        return [self.a]
+        return [self.e, self.f, self.a]
 
     def step(self, pos, vel, neighborlist, sys, generator=None):
         """
@@ -1224,10 +1228,15 @@ class LangevinDynamics(CommonIntegrator):
         """
         # Update 1
         vel = vel + self.timestep * self.a
+        
 
         # Update 2
         pos = pos + vel * self.half_timestep
         vel = self.vel_scale * vel + self.noise_amplitude * self.stored_tensor_for_random_numbers.normal_(generator=generator)
+        # print(self.stored_tensor_for_random_numbers.shape, self.noise_amplitude, self.vel_scale)
+        # self.sum_a = torch.sum(self.a)
+
+
         pos = pos + vel * self.half_timestep
 
         # Recalc new forces
@@ -1718,7 +1727,7 @@ class NoseHooverDynamics(CommonIntegrator):
         # See: .venv/torchff_dev/lib/python3.10/site-packages/openmmtools/integrators.py
         super().__init__(timestep, sys, dtype)
         self.kBT = constants.BOLTZMANN * temperature
-        self.dof = 3 * sys.num_atoms - self.constraint_handler.num_total_constraints
+        self.dof = sys.dim * sys.num_atoms - self.constraint_handler.num_total_constraints
         self.collision_frequency = collision_frequency * constants.FS_TO_INTERNAL
 
         # self.pos_thermostat = 0.0
@@ -1740,7 +1749,8 @@ class NoseHooverDynamics(CommonIntegrator):
         sys : object
             The system object containing force field information.
         """
-        self.a = sys.calc_energy(pos, neighborlist, return_forces=True)[2].to(self.dtype)
+        self.e, self.f, self.a = sys.calc_energy(pos, neighborlist, return_forces=True)
+        self.a.to(self.dtype)
 
     def get_variables_to_detach(self):
         """
@@ -1751,7 +1761,7 @@ class NoseHooverDynamics(CommonIntegrator):
         list
             A list containing the acceleration tensor and thermostat velocity.
         """
-        return [self.a, self.vel_thermostat]
+        return [self.e, self.f, self.a, self.vel_thermostat]
 
     def step(self, pos, vel, neighborlist, sys, generator=None):
         """
@@ -1944,7 +1954,7 @@ class NoseHooverChainDynamics(NoseHooverDynamics):
         self.weights = self.YSWeights[self.n_ys]
 
         self.kBT = constants.BOLTZMANN * temperature
-        self.dof = 3 * sys.num_atoms - self.constraint_handler.num_total_constraints
+        self.dof = sys.dim * sys.num_atoms - self.constraint_handler.num_total_constraints
         self.collision_frequency = collision_frequency * constants.FS_TO_INTERNAL
 
         initial_mass_thermostat = self.kBT / self.collision_frequency**2

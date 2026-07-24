@@ -3,14 +3,15 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["dimos"]
+py-modules = ["dimos-torch"]
 
 [project]
-name = "dimos"
-version = "0.1"
+name = "dimos-torch"
+version = "0.2.1"
 description = "DIMOS: DIfferentiable MOlecular Simulator"
 authors = [ { name="Henrik Christiansen", email="henrik.christiansen@neclab.eu" },
             { name="Takashi Maruyama", email="takashi.maruyama@neclab.eu" },
+            { name="Matheus Ferraz", email="matheus@oncoimmunity.com" },            
             { name="Federico Errica", email="federico.errica@neclab.eu" },
             { name="Viktor Zaverkin", email="viktor.zaverkin@neclab.eu" },
             { name="Makoto Takamoto", email="makoto.takamoto@neclab.eu" },
@@ -25,36 +26,24 @@ classifiers = [
 requires-python = ">=3.10"
 
 dependencies = [
-    "torch>=2.4.1",
-    "ParmEd>=4.2.2",
-    "numpy<2.0.0",
+    "torch>=2.11.0",
+    "ParmEd>=4.2.1",
 ]
 
 [project.optional-dependencies]
 # development dependency groups
 dev = [
-    "openmm[cuda12]>=8.1.1",
+    "openmm[cuda13]>=8.1.1",
     "sphinx>=8.1.3",
     "sphinx-rtd-theme>=3.0.1",
     "matplotlib",
 ]
 
-mmtools = [
-    "openmmtools @ git+https://github.com/choderalab/openmmtools.git",
-    "mpiplus @ git+https://github.com/choderalab/mpiplus.git",
-    "mdtraj",
-    "pymbar",
-    "numba"
-]
-
 mace = [
-    "mace-torch<=0.3.11",
-    "cuequivariance-ops-torch-cu12",
-]
-
-orb = [
-    "orb-models",
-    "pynanoflann @ git+https://github.com/u1234x1234/pynanoflann.git@0.0.8",
+    "mace-torch>=0.3.11",
+    "cuequivariance",
+    "cuequivariance-torch",
+    "cuequivariance-ops-torch-cu13",
 ]
 
 [project.urls]

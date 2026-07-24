@@ -369,478 +369,466 @@
 # document relating to these Terms shall prevail over any translation and any 
 # version in any other language.
 
-
-
 """
-Metadynamics enhanced sampling module.
+Standard Parallel Tempering (Temperature Replica Exchange) for Alanine Dipeptide in Solvent.
 
-This module provides implementations of metadynamics-based enhanced sampling methods
-for molecular simulations. Metadynamics is an advanced sampling technique that adds
-history-dependent bias potentials along collective variables to help systems escape
-from local free energy minima and explore broader regions of configuration space.
+This script runs standard parallel tempering simulations for alanine dipeptide
+in explicit solvent using DIMOS's batched ParallelTempering class.
 
-The module contains the following main classes:
+Replicas are simulated at geometrically spaced temperatures from T_min to T_max.
+Exchanges between adjacent replicas follow the Metropolis criterion based on
+energy and temperature differences.
 
-- CollectiveVariable: Base class for defining collective variables
-- DihedralCV: Implementation of dihedral angle collective variable 
-- TabulatedCVForce: Handler for tabulated biasing forces
-- Metadynamics: Implementation of well-tempered metadynamics
+Output files are written in the same format as hyperspatial_protein_only.py
+so they can be analyzed by the same analysis scripts (analyze_hrex.py, etc.).
 
-These classes enable enhanced sampling simulations using one or two collective 
-variables, with support for periodic and non-periodic variables. The implementation
-includes well-tempered metadynamics to control the growth of the bias potential.
+Usage:
+    python parallel_tempering.py [--T_min 298] [--T_max 600] [--num_replicas 25]
 
-Note: This is currently an experimental feature and should be used with caution.
+Output files (in timestamped directory):
+- coordinates_*.pdb: Trajectories for each replica
+- exchange_statistics.txt: Acceptance rates between replica pairs
+- config.json: Simulation parameters
+- replica_indices.dat: Walker-replica mapping over time
+- energies.dat: Potential energies per replica
 """
 
+import argparse
+import os
+import json
+import math
+from datetime import datetime
 import torch
-from warnings import warn
 
-from dimos.splines import OneDimensionalSpline, TwoDimensionalSpline
-from dimos.utils import get_distance_vectors
-from dimos import constants
+import dimos
+from dimos.simulation import MDSimulation
+from dimos.integrators import LangevinDynamics
+from dimos.batching import MultiSim
+import dimos.advanced_methods.batched_replica_exchange as brex
+import dimos.advanced_methods.replica_exchange as rex
+
+torch.set_default_device("cuda:3")
+torch.set_default_dtype(torch.float64)
+
+# =============================================================================
+# Parse command line arguments
+# =============================================================================
+parser = argparse.ArgumentParser(description="Run standard parallel tempering for alanine dipeptide in solvent")
+parser.add_argument("--T_min", type=float, default=298.0, help="Minimum temperature in K (default: 298.0)")
+parser.add_argument("--T_max", type=float, default=600.0, help="Maximum temperature in K (default: 600.0)")
+parser.add_argument("--num_replicas", type=int, default=15, help="Number of replicas (default: 25)")
+parser.add_argument("--no-compile", action="store_true", help="Disable compilation of step functions")
+args = parser.parse_args()
+args.compile = not args.no_compile
+
+N = args.num_replicas + 1
+
+batched = True
+
+# Exponential temperature spacing (same as in test_replica_exchange.py)
+temperatures = [
+    args.T_min + (args.T_max - args.T_min) * (math.exp(float(i) / float(N - 1)) - 1.0) / (math.e - 1.0)
+    for i in range(N)
+]
+
+config = {
+    # Simulation parameters
+    "n_steps": 10_000_000,         # Total number of PT steps
+    "steps_before_exchange": 100,   # MD steps between exchange attempts
+    "save_interval": 20,            # PT steps between saving coordinates
+
+    # Temperature parameters
+    "temperatures": temperatures,
+    "T_min": args.T_min,
+    "T_max": args.T_max,
+
+    # Integrator parameters
+    "timestep": 0.5,               # femtoseconds
+    "temperature": args.T_min,     # Reference temperature (lowest replica)
+    "friction": 0.001,             # collision rate in 1/fs
+
+    # Force field parameters
+    "nonbonded_type": "Cutoff",
+    "periodic": True,
+    "cutoff": 9.5,                 # Angstroms
+    "switch_distance": 8.0,        # Angstroms
+
+    # Input files
+    "topology_file": "ala2.top",
+    "coordinate_file": "ala2_npt.gro",
+}
+
+# =============================================================================
+# Create output directory
+# =============================================================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_dir = f"pt_{timestamp}_T{args.T_min:.0f}_{args.T_max:.0f}"
+os.makedirs(output_dir, exist_ok=True)
+
+config_path = os.path.join(output_dir, "config.json")
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=4)
+
+print(f"Output directory: {output_dir}")
+print(f"Configuration saved to: {config_path}")
+
+# =============================================================================
+# Create simulations for parallel tempering
+# =============================================================================
+print(f"\n{'='*60}")
+print(f"Setting up Standard Parallel Tempering")
+print(f"Temperatures: {[f'{T:.1f}' for T in temperatures]}")
+print(f"Number of replicas: {N}")
+print(f"{'='*60}")
+
+simulations = []
+
+for idx, temp in enumerate(temperatures):
+    print(f"  Setting up replica {idx} at T = {temp:.2f} K...")
+
+    positions = dimos.utils.read_positions(config["coordinate_file"])
+
+    system = dimos.GromacsForceField(
+        config["topology_file"],
+        config["coordinate_file"],
+        periodic=config["periodic"],
+        nonbonded_type=config["nonbonded_type"],
+        cutoff=config["cutoff"],
+        switch_distance=config["switch_distance"],
+    )
+
+    integrator = LangevinDynamics(
+        timestep=config["timestep"],
+        temperature=temp,
+        friction=config["friction"],
+        sys=system,
+    )
+
+    simulation = MDSimulation(
+        sys=system,
+        integrator=integrator,
+        initial_pos=positions.clone(),
+        temperature=temp,
+    )
+
+    simulations.append(simulation)
 
 
-class CollectiveVariable():
-    """
-    Base class for collective variables used in metadynamics simulations.
+if batched:
+    print(f"\nCreating batched simulation for parallel tempering...")
+    multi_sim = MultiSim(simulations)
 
-    This class provides the foundation for implementing collective variables (CVs) that
-    describe the degrees of freedom along which enhanced sampling is performed.
+    batched_pt = brex.ParallelTempering(
+        multi_sim,
+        steps_before_exchange=config["steps_before_exchange"],
+        compile=args.compile,
+    )
+else:
+    batched_pt = rex.ReplicaExchange(
+        simulations,
+        steps_before_exchange=config["steps_before_exchange"],
+        compile=args.compile,
+    )
 
-    Parameters
-    ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    sigma : float
-        Width parameter for Gaussian hills
-    num_bins : int, optional
-        Number of bins for discretizing the CV space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma) following
-        the OpenMM convention.
+num_replicas = N
 
-    Attributes
-    ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    num_bins : int
-        Number of bins for discretizing the CV space
-    bin_width : float
-        Width of each bin in the discretized space
-    box : float
-        Total range of the CV (max_value - min_value)
-    scaled_sigma : float
-        Squared sigma parameter scaled by box size
-    scaled_grid_points : torch.Tensor
-        Evenly spaced points between 0 and 1 for the scaled CV space
-    """
+# Output PDB files for each replica
+pdb_filenames = [os.path.join(output_dir, f"coordinates_{i}.pdb") for i in range(num_replicas)]
 
-    def __init__(self, min_value, max_value, sigma, num_bins=None):
-        """
-        Initialize the collective variable.
+# =============================================================================
+# Setup output files (same format as HREX for compatible analysis)
+# =============================================================================
+replica_indices_file = os.path.join(output_dir, "replica_indices.dat")
+with open(replica_indices_file, 'w') as f:
+    f.write("# Replica indices: which configuration (walker) is at each replica level\n")
+    f.write("# Step " + " ".join([f"Replica_{i}" for i in range(num_replicas)]) + "\n")
 
-        Parameters
-        ----------
-        min_value : float
-            Minimum value of the collective variable
-        max_value : float
-            Maximum value of the collective variable
-        sigma : float
-            Width parameter for Gaussian hills
-        num_bins : int, optional
-            Number of bins for discretizing the CV space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma) following
-            the OpenMM convention.
-        """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.min_value = min_value
-        self.max_value = max_value
-        self.box = max_value - min_value
-        if num_bins is None:
-            # Default grid width following OpenMM convention: 5 bins per sigma
-            self.num_bins = int(torch.ceil(torch.tensor(5 * self.box / sigma)).item())
+energies_file = os.path.join(output_dir, "energies.dat")
+with open(energies_file, 'w') as f:
+    f.write("# Energies for each replica: E_full and E_3d (identical for standard PT)\n")
+    header = "# Step"
+    for i in range(num_replicas):
+        header += f" E_full_{i} E_3d_{i}"
+    f.write(header + "\n")
+
+# File for per-step exchange log (ground truth acceptance data)
+exchange_log_file = os.path.join(output_dir, "exchange_log.dat")
+with open(exchange_log_file, 'w') as f:
+    f.write("# Per-step exchange log: each line records one attempted pair exchange\n")
+    f.write("# Step Pair Accepted\n")
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+def calc_energy(batched_pt, idx):
+    """Calculate potential energy for replica idx."""
+    with torch.no_grad():
+        if hasattr(batched_pt, 'multi_sim'):
+            pos = batched_pt.multi_sim.get_pos(idx)
+            sim = batched_pt.multi_sim.simulations[idx]
+            if sim.sys.use_neighborlist:
+                neighborlist = batched_pt.multi_sim.neighborlist[idx]
+                energy = sim.sys.calc_energy(pos, neighborlist)
+            else:
+                energy = sim.sys.calc_energy(pos, None)
         else:
-            self.num_bins = num_bins
-        self.bin_width = self.box / self.num_bins
-        self.scaled_sigma = (sigma / self.box)**2
-        self.scaled_grid_points = torch.linspace(0.0, 1.0, self.num_bins)
-
-    def measure_cv(self, simulation):
-        """
-        Measure the value of the collective variable.
-
-        Parameters
-        ----------
-        simulation : object
-            The simulation object containing system state
-
-        Raises
-        ------
-        NotImplementedError
-            This is a base class method that must be implemented by derived classes
-        """
-        raise NotImplementedError()
+            sim = batched_pt.simulations[idx]
+            if sim.sys.use_neighborlist:
+                energy = sim.sys.calc_energy(sim.pos, sim.neighborlist)
+            else:
+                energy = sim.sys.calc_energy(sim.pos, None)
+        return energy.item()
 
 
-class DihedralCV(CollectiveVariable):
-    """
-    Collective variable for dihedral angles.
-
-    This class implements a collective variable based on dihedral angles defined by
-    four atoms. It inherits from the CollectiveVariable base class.
-
-    Parameters
-    ----------
-    four_pair_atoms : list
-        List of four atom indices defining the dihedral angle
-    min_value : float
-        Minimum value of the dihedral angle
-    max_value : float
-        Maximum value of the dihedral angle
-    sigma : float
-        Width parameter for Gaussian hills
-    system : object
-        System object containing simulation parameters
-    num_bins : int, optional
-        Number of bins for discretizing the dihedral space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma).
-
-    Attributes
-    ----------
-    cv_atoms : list
-        List of four atoms defining the dihedral angle
-    system : object
-        Reference to the system object
-    """
-
-    def __init__(self, four_pair_atoms, min_value, max_value, sigma, system, num_bins=None):
-        """
-        Initialize the dihedral collective variable.
-
-        Parameters
-        ----------
-        four_pair_atoms : list
-            List of four atom indices defining the dihedral angle
-        min_value : float
-            Minimum value of the dihedral angle
-        max_value : float
-            Maximum value of the dihedral angle
-        sigma : float
-            Width parameter for Gaussian hills
-        system : object
-            System object containing simulation parameters
-        num_bins : int, optional
-            Number of bins for discretizing the dihedral space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma).
-        """
-        super().__init__(min_value, max_value, sigma, num_bins)
-        self.cv_atoms = four_pair_atoms
-        self.system = system
-
-    def measure_cv(self, pos):
-        """
-        Calculate the dihedral angle for the current configuration.
-
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
-
-        Returns
-        -------
-        torch.Tensor
-            The calculated dihedral angle
-        """
-        v1 = get_distance_vectors(pos, [self.cv_atoms[0], self.cv_atoms[1]], self.system.periodic, self.system.box)
-        v2 = get_distance_vectors(pos, [self.cv_atoms[1], self.cv_atoms[2]], self.system.periodic, self.system.box)
-        v3 = get_distance_vectors(pos, [self.cv_atoms[2], self.cv_atoms[3]], self.system.periodic, self.system.box)
-
-        crossv1 = torch.linalg.cross(v1, v2)
-        crossv2 = torch.linalg.cross(v2, v3)
-        crossv3 = torch.linalg.cross(v2, crossv1)
-
-        normv1 = torch.linalg.vector_norm(crossv1)
-        normv2 = torch.linalg.vector_norm(crossv2)
-        normv3 = torch.linalg.vector_norm(crossv3)
-
-        normcrossv2 = crossv2 / normv2
-
-        cos_phi = torch.sum(crossv1 * normcrossv2) / normv1
-        sin_phi = torch.sum(crossv3 * normcrossv2) / normv3
-        phi = -torch.atan2(sin_phi, cos_phi)
-
-        return phi
+def save_replica_indices(step, batched_pt, filename):
+    """Save the current replica index mapping."""
+    indices = batched_pt.indices.cpu().numpy()
+    with open(filename, 'a') as f:
+        f.write(f"{step} " + " ".join([str(int(i)) for i in indices]) + "\n")
 
 
-class TabulatedCVForce():
-    """
-    Class for handling tabulated forces from collective variables.
+def save_energies(step, batched_pt, num_replicas, filename):
+    """Save energies for all replicas. E_full == E_3d for standard PT."""
+    energies = []
+    for idx in range(num_replicas):
+        e = calc_energy(batched_pt, idx)
+        energies.extend([e, e])  # E_full and E_3d are the same
 
-    This class manages the biasing forces applied along collective variables using
-    spline interpolation of tabulated values.
-
-    Parameters
-    ----------
-    cvs : list
-        List of collective variable objects
-    data_tensor : torch.Tensor
-        Tensor containing the tabulated force data
-    delta_temperature : float
-        Temperature offset for metadynamics
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
-
-    Attributes
-    ----------
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    cv_from_spline : OneDimensionalSpline or TwoDimensionalSpline
-        Spline interpolator for the CV forces
-    """
-
-    def __init__(self, cvs, data_tensor, delta_temperature, periodic_cvs=True):
-        """
-        Initialize the tabulated CV force handler.
-
-        Parameters
-        ----------
-        cvs : list
-            List of collective variable objects
-        data_tensor : torch.Tensor
-            Tensor containing the tabulated force data
-        delta_temperature : float
-            Temperature offset for metadynamics
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
-        """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.periodic_cvs = periodic_cvs
-
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.cv_bins = torch.linspace(self.cv.min_value, self.cv.max_value, self.cv.num_bins)
-                self.cv_from_spline = OneDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=periodic_cvs)
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_x_bins = torch.linspace(self.cv_x.min_value, self.cv_x.max_value, self.cv_x.num_bins)
-                self.cv_y = self.cvs[1]
-                self.cv_y_bins = torch.linspace(self.cv_y.min_value, self.cv_y.max_value, self.cv_y.num_bins)
-                self.cv_from_spline = TwoDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def __str__(self):
-        """
-        Get string representation.
-
-        Returns
-        -------
-        str
-            Description of the tabulated CV force
-        """
-        return "Tabulated CV"
-
-    def update_data_tensor(self, data_tensor):
-        """
-        Update the tabulated force data.
-
-        Parameters
-        ----------
-        data_tensor : torch.Tensor
-            New force data tensor
-        """
-        match len(self.cvs):
-            case 1:
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=self.periodic_cvs)
-            case 2:
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=self.periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def calc_energy(self, pos):
-        """
-        Calculate the bias energy for the current configuration.
-
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
-
-        Returns
-        -------
-        torch.Tensor
-            The calculated bias energy
-        """
-        match len(self.cvs):
-            case 1:
-                simulation_value_cv = self.cv.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv)
-            case 2:
-                simulation_value_cv_x = self.cv_x.measure_cv(pos)
-                simulation_value_cv_y = self.cv_y.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv_x, simulation_value_cv_y)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-        energy = B
-        return energy
+    with open(filename, 'a') as f:
+        f.write(f"{step} " + " ".join([f"{e:.6f}" for e in energies]) + "\n")
 
 
-class Metadynamics:
-    """
-    Implementation of metadynamics enhanced sampling.
+# =============================================================================
+# Logging
+# =============================================================================
+stats_interval = 1
+stats_log_file = os.path.join(output_dir, "statistics_log.txt")
 
-    This class implements well-tempered metadynamics for enhanced sampling along one or two
-    collective variables. It adds Gaussian bias potentials to help the system escape from
-    local free energy minima.
-
-    Parameters
-    ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables to bias
-    delta_temperature : float
-        Temperature offset for well-tempered metadynamics
-    initial_height : float, optional
-        Initial height of Gaussian hills, default 1.0
-    update_frequency : int, optional
-        Frequency of bias updates in simulation steps, default 1
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
-
-    Attributes
-    ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    initial_height : float
-        Initial height of Gaussian hills
-    update_frequency : int
-        Frequency of bias updates
-    periodic_cvs : bool
-        Whether CVs are periodic
-    current_bias : torch.Tensor
-        Current accumulated bias potential
-    """
-
-    def __init__(self, simulation, cvs, delta_temperature, initial_height=1.0, update_frequency=1, periodic_cvs=True):
-        """
-        Initialize metadynamics simulation.
-
-        Parameters
-        ----------
-        simulation : object
-            The simulation object
-        cvs : list
-            List of collective variables to bias
-        delta_temperature : float
-            Temperature offset for well-tempered metadynamics
-        initial_height : float, optional
-            Initial height of Gaussian hills, default 1.0
-        update_frequency : int, optional
-            Frequency of bias updates in simulation steps, default 1
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
-        """
-
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-
-        self.simulation = simulation
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.initial_height = initial_height
-        self.update_frequency = update_frequency
-        self.periodic_cvs = periodic_cvs
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.current_bias = torch.zeros((self.cv.num_bins))
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_y = self.cvs[1]
-                self.current_bias = torch.zeros((self.cv_x.num_bins, self.cv_y.num_bins))
-
-        force = TabulatedCVForce(cvs, self.current_bias, delta_temperature, periodic_cvs=periodic_cvs)
-        self.simulation.sys.cv_force = force
-
-    def get_free_energy(self):
-        """
-        Calculate the current estimate of the free energy surface.
-
-        Returns
-        -------
-        torch.Tensor
-            The estimated free energy surface
-        """
-        #print(self.current_bias)
-        return - ((self.simulation.temperature + self.delta_temperature) / self.delta_temperature) * self.current_bias
+with open(stats_log_file, 'w') as f:
+    f.write(f"Parallel Tempering Statistics Log\n")
+    f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Temperatures: {temperatures}\n")
+    f.write(f"System: Alanine dipeptide in solvent (periodic)\n")
+    f.write(f"{'='*80}\n\n")
 
 
-    def step(self, update_weights=True):
-        """
-        Perform a metadynamics step.
+def log_statistics(step, batched_pt, num_replicas, temperatures, log_file, to_terminal=True):
+    """Log intermediate statistics to terminal and file."""
+    lines = []
+    lines.append(f"\n{'='*80}")
+    lines.append(f"Step {step + 1}/{config['n_steps']} ({100*(step+1)/config['n_steps']:.2f}%)")
+    lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"{'-'*80}")
 
-        Parameters
-        ----------
-        update_weights : bool, optional
-            Whether to update the bias weights, default True
-        """
-        self.simulation.step(self.update_frequency)
-        if update_weights:
-            match len(self.cvs):
-                case 1:
-                    simulation_value_cv = self.cv.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
+    # Replica statistics
+    lines.append("Replica Statistics:")
+    lines.append(f"{'Replica':>8} {'T (K)':>10} {'Energy':>15}")
+    lines.append(f"{'-'*40}")
 
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
+    for idx in range(num_replicas):
+        lines.append(f"{idx:>8} {temperatures[idx]:>10.2f} {0.0:>15.4f}")
 
-                    scaled_value_cv = (simulation_value_cv - self.cv.min_value) / self.cv.box
-                    if self.periodic_cvs:
-                        scaled_value_cv = scaled_value_cv % 1.0
-                    dist = torch.abs(self.cv.scaled_grid_points - scaled_value_cv)
-                    if self.periodic_cvs:
-                        temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                        dist = torch.min(temp_dist, dim=0).values
-                        dist[-1] = dist[0]
-                    add_value = torch.exp(-0.5 * dist * dist / self.cv.scaled_sigma)
-                    self.current_bias = self.current_bias + metad_height * add_value
-                case 2:
-                    simulation_value_cv_x = self.cv_x.measure_cv(self.simulation.pos)
-                    simulation_value_cv_y = self.cv_y.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
+    # Exchange statistics
+    lines.append(f"\n{'-'*80}")
+    lines.append("Exchange Statistics (cumulative):")
+    lines.append(f"{'Pair':>10} {'Attempted':>12} {'Accepted':>12} {'Rate':>10}")
+    lines.append(f"{'-'*50}")
 
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
+    attempted = batched_pt.attempted_swaps
+    accepted = batched_pt.accepted_swaps
 
-                    cv_add_values = []
-                    for idx, simulation_value_cv in enumerate((simulation_value_cv_x, simulation_value_cv_y)):
-                        scaled_value_cv = (simulation_value_cv - self.cvs[idx].min_value) / self.cvs[idx].box
-                        if self.periodic_cvs:
-                            scaled_value_cv = scaled_value_cv % 1.0
-                        dist = torch.abs(self.cvs[idx].scaled_grid_points - scaled_value_cv)
-                        if self.periodic_cvs:
-                            temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                            dist = torch.min(temp_dist, dim=0).values
-                            dist[-1] = dist[0]
-                        add_value = torch.exp(-0.5 * dist * dist / self.cvs[idx].scaled_sigma)
-                        cv_add_values.append(add_value)
-                    # Reverse order to match OpenMM's reduce(np.multiply.outer, reversed(axisGaussians))
-                    add_values_xy = torch.outer(cv_add_values[1], cv_add_values[0]).T
-                    self.current_bias = self.current_bias + metad_height * add_values_xy
-                case _:
-                    raise NotImplementedError("More than two collective variables are currently not implemented")
-            self.simulation.sys.cv_force.update_data_tensor(self.current_bias.detach())
-            self.current_bias.detach_()
+    for i in range(len(attempted)):
+        att = int(attempted[i].item())
+        acc = int(accepted[i].item())
+        rate = acc / att if att > 0 else 0.0
+        lines.append(f"{i:>4}-{i+1:<4} {att:>12} {acc:>12} {rate:>10.4f}")
+
+    total_attempted = sum(attempted[i].item() for i in range(len(attempted)))
+    total_accepted = sum(accepted[i].item() for i in range(len(accepted)))
+    overall_rate = total_accepted / total_attempted if total_attempted > 0 else 0.0
+    lines.append(f"{'-'*50}")
+    lines.append(f"{'Overall':>10} {int(total_attempted):>12} {int(total_accepted):>12} {overall_rate:>10.4f}")
+
+    lines.append(f"{'='*80}\n")
+
+    if to_terminal:
+        for line in lines:
+            print(line)
+
+    with open(log_file, 'a') as f:
+        for line in lines:
+            f.write(line + "\n")
+
+
+import time as _time
+
+# =============================================================================
+# Warmup step
+# =============================================================================
+print("Running warmup step to trigger compilation...")
+torch.cuda.synchronize()
+_warmup_t0 = _time.perf_counter()
+batched_pt.step(steps=1, detach=True)
+torch.cuda.synchronize()
+_warmup_t1 = _time.perf_counter()
+print(f"Warmup step took {_warmup_t1 - _warmup_t0:.3f} s (compilation overhead absorbed)\n")
+
+batched_pt.reset_acceptance_statistics()
+
+# =============================================================================
+# Timing output file
+# =============================================================================
+timing_file = os.path.join(output_dir, "timing.dat")
+with open(timing_file, 'w') as f:
+    f.write("# Per-step timing (seconds). Warmup step excluded.\n")
+    f.write(f"# Warmup time: {_warmup_t1 - _warmup_t0:.6f} s\n")
+    f.write("# step  t_md_swap  t_io  t_total\n")
+
+_sim_start = _time.perf_counter()
+
+# =============================================================================
+# Run parallel tempering simulation
+# =============================================================================
+print(f"\n{'='*60}")
+print(f"Running Parallel Tempering simulation")
+print(f"Total PT steps: {config['n_steps']}")
+print(f"MD steps per exchange attempt: {config['steps_before_exchange']}")
+print(f"Saving every {config['save_interval']} steps")
+print(f"{'='*60}")
+
+for step in range(config["n_steps"]):
+    # -- time MD + swap --
+    torch.cuda.synchronize()
+    _t0 = _time.perf_counter()
+    # Snapshot cumulative counters before step
+    _att_before = batched_pt.attempted_swaps.clone()
+    _acc_before = batched_pt.accepted_swaps.clone()
+    batched_pt.step(steps=1, detach=True)
+    torch.cuda.synchronize()
+    _t1 = _time.perf_counter()
+
+    # -- time I/O --
+    _t_io_start = _time.perf_counter()
+
+    # Log per-step exchange outcomes
+    _att_diff = batched_pt.attempted_swaps - _att_before
+    _acc_diff = batched_pt.accepted_swaps - _acc_before
+    with open(exchange_log_file, 'a') as f:
+        for _pair_i in range(len(_att_diff)):
+            if int(_att_diff[_pair_i].item()) > 0:
+                f.write(f"{step} {_pair_i} {int(_acc_diff[_pair_i].item())}\n")
+
+    # Save replica indices every step (for accurate round-trip analysis)
+    save_replica_indices(step, batched_pt, replica_indices_file)
+
+    if step % config["save_interval"] == 0:
+        for idx in range(num_replicas):
+            if hasattr(batched_pt, 'multi_sim'):
+                pos = batched_pt.multi_sim.get_pos(idx)
+            else:
+                pos = batched_pt.simulations[idx].pos
+            simulations[idx].sys.write_config(pos, pdb_filenames[idx], unwrap=False)
+
+        save_energies(step, batched_pt, num_replicas, energies_file)
+
+    if (step + 1) % stats_interval == 0:
+        log_statistics(step, batched_pt, num_replicas, temperatures, stats_log_file, to_terminal=True)
+
+    _t_io_end = _time.perf_counter()
+
+    _t_md_swap = _t1 - _t0
+    _t_io = _t_io_end - _t_io_start
+    _t_total = _t_io_end - _t0
+    with open(timing_file, 'a') as f:
+        f.write(f"{step}  {_t_md_swap:.6f}  {_t_io:.6f}  {_t_total:.6f}\n")
+
+# =============================================================================
+# Timing summary
+# =============================================================================
+_sim_end = _time.perf_counter()
+_sim_elapsed = _sim_end - _sim_start
+
+_md_times = []
+_io_times = []
+_total_times = []
+with open(timing_file, 'r') as f:
+    for line in f:
+        if line.startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) == 4:
+            _md_times.append(float(parts[1]))
+            _io_times.append(float(parts[2]))
+            _total_times.append(float(parts[3]))
+
+if _md_times:
+    import statistics
+    _summary = (
+        f"\n{'='*60}\n"
+        f"Timing Summary (excluding warmup)\n"
+        f"{'='*60}\n"
+        f"  Total wall time : {_sim_elapsed:.2f} s\n"
+        f"  Steps           : {len(_md_times)}\n"
+        f"  Avg step total  : {statistics.mean(_total_times)*1000:.2f} ms\n"
+        f"  Avg MD+swap     : {statistics.mean(_md_times)*1000:.2f} ms\n"
+        f"  Avg I/O         : {statistics.mean(_io_times)*1000:.2f} ms\n"
+        f"  Median MD+swap  : {statistics.median(_md_times)*1000:.2f} ms\n"
+        f"  Min/Max MD+swap : {min(_md_times)*1000:.2f} / {max(_md_times)*1000:.2f} ms\n"
+        f"  Throughput      : {len(_md_times)/_sim_elapsed:.2f} steps/s\n"
+        f"  Timing saved to : {timing_file}\n"
+        f"{'='*60}\n"
+    )
+    print(_summary)
+    with open(timing_file, 'a') as f:
+        f.write(_summary)
+
+# =============================================================================
+# Final statistics
+# =============================================================================
+print(f"\n{'='*60}")
+print("Final Exchange Statistics:")
+print("-" * 60)
+
+stats_lines = []
+attempted = batched_pt.attempted_swaps
+accepted = batched_pt.accepted_swaps
+
+for i in range(len(attempted)):
+    rate = accepted[i].item() / attempted[i].item() if attempted[i].item() > 0 else 0.0
+    line = f"Replica pair {i}-{i+1} (T={temperatures[i]:.1f}-{temperatures[i+1]:.1f} K): Attempted={int(attempted[i].item())}, Accepted={int(accepted[i].item())}, Rate={rate:.4f}"
+    print(line)
+    stats_lines.append(line)
+
+print("-" * 60)
+
+stats_file = os.path.join(output_dir, "exchange_statistics.txt")
+with open(stats_file, 'w') as f:
+    f.write("Final Exchange Statistics (Standard Parallel Tempering)\n")
+    f.write("-" * 60 + "\n")
+    f.write(f"Temperatures: {temperatures}\n")
+    f.write("-" * 60 + "\n")
+    for line in stats_lines:
+        f.write(line + "\n")
+
+with open(stats_log_file, 'a') as f:
+    f.write("\n" + "=" * 80 + "\n")
+    f.write("FINAL EXCHANGE STATISTICS\n")
+    f.write("-" * 60 + "\n")
+    for line in stats_lines:
+        f.write(line + "\n")
+    f.write(f"\nSimulation completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+print(f"\n{'='*60}")
+print(f"Parallel Tempering simulation complete.")
+print(f"Results saved to: {output_dir}")
+print(f"{'='*60}")
+
+print("\nOutput files:")
+for i, pdb_file in enumerate(pdb_filenames):
+    print(f"  Replica {i} (T={temperatures[i]:.1f} K): {pdb_file}")
+print(f"  Statistics log: {stats_log_file}")
+print(f"  Exchange statistics: {stats_file}")
+print(f"  Replica indices: {replica_indices_file}")
+print(f"  Energies: {energies_file}")
+print(f"  Exchange log: {exchange_log_file}")
+print(f"  Configuration: {config_path}")

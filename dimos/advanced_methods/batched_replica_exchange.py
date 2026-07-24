@@ -372,475 +372,288 @@
 
 
 """
-Metadynamics enhanced sampling module.
+Replica Exchange enhanced sampling module.
 
-This module provides implementations of metadynamics-based enhanced sampling methods
-for molecular simulations. Metadynamics is an advanced sampling technique that adds
-history-dependent bias potentials along collective variables to help systems escape
-from local free energy minima and explore broader regions of configuration space.
+This module provides implementations of replica exchange molecular dynamics (REMD),
+also known as parallel tempering. REMD enhances sampling by running multiple replicas
+of a system at different temperatures or with different Hamiltonians and periodically
+attempting to exchange configurations between replicas.
 
-The module contains the following main classes:
+The module contains the following main class:
 
-- CollectiveVariable: Base class for defining collective variables
-- DihedralCV: Implementation of dihedral angle collective variable 
-- TabulatedCVForce: Handler for tabulated biasing forces
-- Metadynamics: Implementation of well-tempered metadynamics
+- replica_exchange: Implementation of the replica exchange algorithm
 
-These classes enable enhanced sampling simulations using one or two collective 
-variables, with support for periodic and non-periodic variables. The implementation
-includes well-tempered metadynamics to control the growth of the bias potential.
-
-Note: This is currently an experimental feature and should be used with caution.
+This class enables enhanced sampling by:
+- Running multiple replicas in parallel at different temperatures/Hamiltonians
+- Periodically attempting exchanges between replicas using the Metropolis criterion
+- Handling position and velocity exchanges with appropriate temperature scaling
+- Supporting both molecular dynamics and Monte Carlo replicas
 """
 
 import torch
-from warnings import warn
-
-from dimos.splines import OneDimensionalSpline, TwoDimensionalSpline
-from dimos.utils import get_distance_vectors
 from dimos import constants
 
+from dimos import timer_func
+from dimos.batching import MultiSim
 
-class CollectiveVariable():
+class ReplicaExchange():
     """
-    Base class for collective variables used in metadynamics simulations.
+    Class for handling replica exchange molecular dynamics (REMD) simulations.
 
-    This class provides the foundation for implementing collective variables (CVs) that
-    describe the degrees of freedom along which enhanced sampling is performed.
+    This class implements the replica exchange algorithm, also known as parallel tempering,
+    which enhances sampling by exchanging configurations between replicas running at different
+    temperatures or with different Hamiltonians.
 
     Parameters
     ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    sigma : float
-        Width parameter for Gaussian hills
-    num_bins : int, optional
-        Number of bins for discretizing the CV space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma) following
-        the OpenMM convention.
+    simulations : list
+        List of MDSimulations or MCSimulations with different Hamiltonians or temperatures
+    steps_before_exchange : int, optional
+        Number of steps before attempting an exchange, by default 1
+    num_exchange_attempts : int, optional
+        Number of exchange attempts per replica exchange step, by default 50
 
     Attributes
     ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    num_bins : int
-        Number of bins for discretizing the CV space
-    bin_width : float
-        Width of each bin in the discretized space
-    box : float
-        Total range of the CV (max_value - min_value)
-    scaled_sigma : float
-        Squared sigma parameter scaled by box size
-    scaled_grid_points : torch.Tensor
-        Evenly spaced points between 0 and 1 for the scaled CV space
+    simulations : list
+        List of simulation objects running in parallel
+    steps_before_exchange : int
+        Number of simulation steps between exchange attempts
+    num_simulations : int
+        Total number of replica simulations
+    num_exchange_attempts : int
+        Number of exchange attempts per replica exchange step
     """
 
-    def __init__(self, min_value, max_value, sigma, num_bins=None):
+    def __init__(self, multi_sim: MultiSim, steps_before_exchange=1, compile=True):
         """
-        Initialize the collective variable.
+        Initialize the replica exchange simulation.
 
         Parameters
         ----------
-        min_value : float
-            Minimum value of the collective variable
-        max_value : float
-            Maximum value of the collective variable
-        sigma : float
-            Width parameter for Gaussian hills
-        num_bins : int, optional
-            Number of bins for discretizing the CV space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma) following
-            the OpenMM convention.
+        simulations : list
+            List of MDSimulations or MCSimulations with different Hamiltonians or temperatures
+        steps_before_exchange : int, optional
+            Number of steps before attempting an exchange, by default 1
+        num_exchange_attempts : int, optional
+            Number of exchange attempts per replica exchange step, by default 50
         """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.min_value = min_value
-        self.max_value = max_value
-        self.box = max_value - min_value
-        if num_bins is None:
-            # Default grid width following OpenMM convention: 5 bins per sigma
-            self.num_bins = int(torch.ceil(torch.tensor(5 * self.box / sigma)).item())
+        self.multi_sim = multi_sim 
+        #self.steps_before_exchange = steps_before_exchange
+        self.simulations = self.multi_sim.simulations
+        self.steps_before_exchange = steps_before_exchange
+        self.num_simulations = len(self.simulations)
+        self.rng_generator = self.multi_sim.rng_generator
+
+        self._initialize_statistics()
+        self._compile_step(compile)
+
+    def _compile_step(self, compile):
+        if compile:
+            print("Compiling Replica Exchange step functions")
+            torch._dynamo.config.cache_size_limit = 1_000_000
+            self.step_function = [torch.compile(self.multi_sim.step, mode="max-autotune-no-cudagraphs"),]
         else:
-            self.num_bins = num_bins
-        self.bin_width = self.box / self.num_bins
-        self.scaled_sigma = (sigma / self.box)**2
-        self.scaled_grid_points = torch.linspace(0.0, 1.0, self.num_bins)
+            self.step_function = [self.multi_sim.step,]
 
-    def measure_cv(self, simulation):
-        """
-        Measure the value of the collective variable.
+    def _initialize_statistics(self):
+        self.indices = torch.tensor(range(0,self.num_simulations), requires_grad=False)
+        self.attempted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+        self.accepted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+        
+    def print_pdb(self, base_filename):
+        for idx, sim in enumerate(self.simulations):
+            sim.sys.write_config(self.get_pos(idx)[:,:3], base_filename+f"_{idx}.pdb", box=sim.sys.box[:3])
 
-        Parameters
-        ----------
-        simulation : object
-            The simulation object containing system state
+    def reset_acceptance_statistics(self):
+        self.attempted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+        self.accepted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
 
-        Raises
-        ------
-        NotImplementedError
-            This is a base class method that must be implemented by derived classes
-        """
-        raise NotImplementedError()
-
-
-class DihedralCV(CollectiveVariable):
-    """
-    Collective variable for dihedral angles.
-
-    This class implements a collective variable based on dihedral angles defined by
-    four atoms. It inherits from the CollectiveVariable base class.
-
-    Parameters
-    ----------
-    four_pair_atoms : list
-        List of four atom indices defining the dihedral angle
-    min_value : float
-        Minimum value of the dihedral angle
-    max_value : float
-        Maximum value of the dihedral angle
-    sigma : float
-        Width parameter for Gaussian hills
-    system : object
-        System object containing simulation parameters
-    num_bins : int, optional
-        Number of bins for discretizing the dihedral space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma).
-
-    Attributes
-    ----------
-    cv_atoms : list
-        List of four atoms defining the dihedral angle
-    system : object
-        Reference to the system object
-    """
-
-    def __init__(self, four_pair_atoms, min_value, max_value, sigma, system, num_bins=None):
-        """
-        Initialize the dihedral collective variable.
-
-        Parameters
-        ----------
-        four_pair_atoms : list
-            List of four atom indices defining the dihedral angle
-        min_value : float
-            Minimum value of the dihedral angle
-        max_value : float
-            Maximum value of the dihedral angle
-        sigma : float
-            Width parameter for Gaussian hills
-        system : object
-            System object containing simulation parameters
-        num_bins : int, optional
-            Number of bins for discretizing the dihedral space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma).
-        """
-        super().__init__(min_value, max_value, sigma, num_bins)
-        self.cv_atoms = four_pair_atoms
-        self.system = system
-
-    def measure_cv(self, pos):
-        """
-        Calculate the dihedral angle for the current configuration.
-
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
-
-        Returns
-        -------
-        torch.Tensor
-            The calculated dihedral angle
-        """
-        v1 = get_distance_vectors(pos, [self.cv_atoms[0], self.cv_atoms[1]], self.system.periodic, self.system.box)
-        v2 = get_distance_vectors(pos, [self.cv_atoms[1], self.cv_atoms[2]], self.system.periodic, self.system.box)
-        v3 = get_distance_vectors(pos, [self.cv_atoms[2], self.cv_atoms[3]], self.system.periodic, self.system.box)
-
-        crossv1 = torch.linalg.cross(v1, v2)
-        crossv2 = torch.linalg.cross(v2, v3)
-        crossv3 = torch.linalg.cross(v2, crossv1)
-
-        normv1 = torch.linalg.vector_norm(crossv1)
-        normv2 = torch.linalg.vector_norm(crossv2)
-        normv3 = torch.linalg.vector_norm(crossv3)
-
-        normcrossv2 = crossv2 / normv2
-
-        cos_phi = torch.sum(crossv1 * normcrossv2) / normv1
-        sin_phi = torch.sum(crossv3 * normcrossv2) / normv3
-        phi = -torch.atan2(sin_phi, cos_phi)
-
-        return phi
-
-
-class TabulatedCVForce():
-    """
-    Class for handling tabulated forces from collective variables.
-
-    This class manages the biasing forces applied along collective variables using
-    spline interpolation of tabulated values.
-
-    Parameters
-    ----------
-    cvs : list
-        List of collective variable objects
-    data_tensor : torch.Tensor
-        Tensor containing the tabulated force data
-    delta_temperature : float
-        Temperature offset for metadynamics
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
-
-    Attributes
-    ----------
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    cv_from_spline : OneDimensionalSpline or TwoDimensionalSpline
-        Spline interpolator for the CV forces
-    """
-
-    def __init__(self, cvs, data_tensor, delta_temperature, periodic_cvs=True):
-        """
-        Initialize the tabulated CV force handler.
-
-        Parameters
-        ----------
-        cvs : list
-            List of collective variable objects
-        data_tensor : torch.Tensor
-            Tensor containing the tabulated force data
-        delta_temperature : float
-            Temperature offset for metadynamics
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
-        """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.periodic_cvs = periodic_cvs
-
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.cv_bins = torch.linspace(self.cv.min_value, self.cv.max_value, self.cv.num_bins)
-                self.cv_from_spline = OneDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=periodic_cvs)
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_x_bins = torch.linspace(self.cv_x.min_value, self.cv_x.max_value, self.cv_x.num_bins)
-                self.cv_y = self.cvs[1]
-                self.cv_y_bins = torch.linspace(self.cv_y.min_value, self.cv_y.max_value, self.cv_y.num_bins)
-                self.cv_from_spline = TwoDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def __str__(self):
-        """
-        Get string representation.
-
-        Returns
-        -------
-        str
-            Description of the tabulated CV force
-        """
-        return "Tabulated CV"
-
-    def update_data_tensor(self, data_tensor):
-        """
-        Update the tabulated force data.
-
-        Parameters
-        ----------
-        data_tensor : torch.Tensor
-            New force data tensor
-        """
-        match len(self.cvs):
-            case 1:
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=self.periodic_cvs)
-            case 2:
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=self.periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def calc_energy(self, pos):
-        """
-        Calculate the bias energy for the current configuration.
-
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
-
-        Returns
-        -------
-        torch.Tensor
-            The calculated bias energy
-        """
-        match len(self.cvs):
-            case 1:
-                simulation_value_cv = self.cv.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv)
-            case 2:
-                simulation_value_cv_x = self.cv_x.measure_cv(pos)
-                simulation_value_cv_y = self.cv_y.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv_x, simulation_value_cv_y)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-        energy = B
+    def energy(self, base_idx, idx):
+        pos = self.multi_sim.get_pos(idx)
+        if self.multi_sim.simulations[base_idx].sys.use_neighborlist:
+            neighborlist = self.multi_sim.neighborlist[idx]
+            energy = self.multi_sim.simulations[base_idx].sys.calc_energy(pos, neighborlist)
+        else:
+            energy = self.multi_sim.simulations[base_idx].sys.calc_energy(pos, None)
         return energy
 
+    def do_exchange(self, first_index, second_index):
+        # Get slice indices for positions/velocities
+        start_0 = self.multi_sim.sys.start_index[first_index]
+        end_0 = self.multi_sim.sys.start_index[first_index + 1]
+        start_1 = self.multi_sim.sys.start_index[second_index]
+        end_1 = self.multi_sim.sys.start_index[second_index + 1]
+        
+        # Swap positions
+        self.multi_sim.pos[start_0:end_0], self.multi_sim.pos[start_1:end_1] = \
+            self.multi_sim.pos[start_1:end_1].clone(), self.multi_sim.pos[start_0:end_0].clone()
+        
+        # Swap velocities
+        vel_0 = self.multi_sim.vel[start_1:end_1].clone()
+        vel_1 = self.multi_sim.vel[start_0:end_0].clone()
+        
+        # Scale velocities if temperatures differ (for proper Maxwell-Boltzmann distribution)
+        temp_0 = self.simulations[first_index].temperature
+        temp_1 = self.simulations[second_index].temperature
+        if temp_0 != temp_1:
+            scaling_factor = (temp_1 / temp_0) ** 0.5
+            vel_0 = vel_0 / scaling_factor  # vel going to replica 0 (was at temp_1, now at temp_0)
+            vel_1 = vel_1 * scaling_factor  # vel going to replica 1 (was at temp_0, now at temp_1)
+        
+        self.multi_sim.vel[start_0:end_0] = vel_0
+        self.multi_sim.vel[start_1:end_1] = vel_1
 
-class Metadynamics:
+        # Swap neighborlists if used
+        if self.multi_sim.simulations[first_index].sys.use_neighborlist:
+            self.multi_sim.neighborlist[first_index], self.multi_sim.neighborlist[second_index] = \
+                self.multi_sim.neighborlist[second_index], self.multi_sim.neighborlist[first_index]
+            self.multi_sim.neighbor_handlers[first_index].original_pos, self.multi_sim.neighbor_handlers[second_index].original_pos = \
+                self.multi_sim.neighbor_handlers[second_index].original_pos.clone(), self.multi_sim.neighbor_handlers[first_index].original_pos.clone()
+            # Also swap the handler's internal neighborlist to stay consistent with original_pos.
+            # Without this, check_recalc returns the stale internal list (built for the pre-swap
+            # configuration) whenever no rebuild is triggered, silently undoing the neighborlist swap.
+            self.multi_sim.neighbor_handlers[first_index].neighborlist, self.multi_sim.neighbor_handlers[second_index].neighborlist = \
+                self.multi_sim.neighborlist[first_index], self.multi_sim.neighborlist[second_index]
+        
+        # Update replica tracking indices (use .clone() to avoid PyTorch view aliasing)
+        temp = self.indices[first_index].clone()
+        self.indices[first_index] = self.indices[second_index]
+        self.indices[second_index] = temp
+
+    def _calc_acceptance_criterion(self, first_index, second_index):
+        potential_energy_0_0 = self.energy(first_index, first_index)
+        potential_energy_1_1 = self.energy(second_index, second_index)
+
+        potential_energy_0_1 = self.energy(first_index, second_index)
+        potential_energy_1_0 = self.energy(second_index, first_index)
+
+        delta_energy_temp = (potential_energy_0_0 - potential_energy_0_1) / self.simulations[first_index].temperature / constants.BOLTZMANN + \
+                                        (potential_energy_1_1 - potential_energy_1_0) / self.simulations[second_index].temperature / constants.BOLTZMANN
+
+        # NPT volume term (needed for constant pressure simulations)
+        delta_volume = 0.0
+        simulation_0 = self.simulations[first_index]
+        simulation_1 = self.simulations[second_index]
+        if hasattr(simulation_0, 'barostat') and simulation_0.barostat is not None and \
+           hasattr(simulation_1, 'barostat') and simulation_1.barostat is not None:
+            delta_volume = (simulation_0.barostat.target_pressure / (constants.BOLTZMANN * simulation_0.barostat.target_temperature) - 
+                           simulation_1.barostat.target_pressure / (constants.BOLTZMANN * simulation_1.barostat.target_temperature)) * \
+                          (torch.prod(simulation_0.sys.box) - torch.prod(simulation_1.sys.box))
+
+        acceptance_criterion = torch.exp(delta_energy_temp + delta_volume)
+        return acceptance_criterion
+
+    def step(self, steps=1, detach=True):
+        """
+        Perform a complete replica exchange step.
+
+        This method:
+        1. Runs each replica for steps_before_exchange steps
+        2. Attempts num_exchange_attempts exchanges between random pairs of replicas
+        3. For each successful exchange:
+           - Swaps positions between replicas
+           - If velocities exist, scales and swaps them according to temperature differences
+
+
+        Notes
+        -----
+        The acceptance probability is calculated using the Metropolis criterion with
+        the temperature-weighted energy differences between replicas. For temperature
+        replicas, velocities are scaled by sqrt(T_new/T_old) during exchanges.
+        """
+
+        acceptance_rates = []
+        for _ in range(steps):
+            # Simulate the specified number of steps and gather the simulations information
+            # Do parallel executions either via pyTorch parallelism or Python parallelism            
+            for step_fn in self.step_function:
+                step_fn(self.steps_before_exchange, detach=detach)
+
+            with torch.no_grad():
+                even = int(torch.empty(()).uniform_(generator=self.rng_generator) > 0.5)
+                for index in range(self.num_simulations//2):
+                    first_index = 2*index+even
+                    second_index = 2*index+even+1
+                    if second_index >= self.num_simulations:
+                        continue
+
+                    self.attempted_swaps[first_index] = self.attempted_swaps[first_index] + 1
+
+                    acceptance_criterion = self._calc_acceptance_criterion(first_index, second_index)
+                    acceptance_rates.append(acceptance_criterion)
+
+                    if acceptance_criterion >= torch.empty(()).uniform_(generator=self.rng_generator):
+                        self.accepted_swaps[first_index] = self.accepted_swaps[first_index] + 1
+
+                        self.do_exchange(first_index, second_index)
+            
+            # Recalc acceleration stored in integrator.
+            if self.multi_sim.sys.use_neighborlist:
+                self.multi_sim.integrator.update_acceleration(self.multi_sim.pos, self.multi_sim.get_combined_torch_neigborlist(), self.multi_sim.sys)
+            else:
+                self.multi_sim.integrator.update_acceleration(self.multi_sim.pos, None, self.multi_sim.sys)
+
+            if detach:
+                self.multi_sim.detach_()
+        return acceptance_rates
+
+
+
+class ParallelTempering(ReplicaExchange):
     """
-    Implementation of metadynamics enhanced sampling.
+    Class for handling parallel tempering simulations.
 
-    This class implements well-tempered metadynamics for enhanced sampling along one or two
-    collective variables. It adds Gaussian bias potentials to help the system escape from
-    local free energy minima.
+    This class implements the parallel tempering algorithm, a specific case of replica exchange
+    where replicas are run at different temperatures to enhance sampling.
 
     Parameters
     ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables to bias
-    delta_temperature : float
-        Temperature offset for well-tempered metadynamics
-    initial_height : float, optional
-        Initial height of Gaussian hills, default 1.0
-    update_frequency : int, optional
-        Frequency of bias updates in simulation steps, default 1
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
+    simulations : list
+        List of MDSimulations or MCSimulations with different temperatures
+    steps_before_exchange : int, optional
+        Number of steps before attempting an exchange, by default 1
 
     Attributes
     ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    initial_height : float
-        Initial height of Gaussian hills
-    update_frequency : int
-        Frequency of bias updates
-    periodic_cvs : bool
-        Whether CVs are periodic
-    current_bias : torch.Tensor
-        Current accumulated bias potential
+    simulations : list
+        List of simulation objects running in parallel
+    steps_before_exchange : int
+        Number of simulation steps between exchange attempts
+    num_simulations : int
+        Total number of replica simulations
     """
 
-    def __init__(self, simulation, cvs, delta_temperature, initial_height=1.0, update_frequency=1, periodic_cvs=True):
+    def __init__(self, multi_sim: MultiSim, steps_before_exchange=1, compile=True):
         """
-        Initialize metadynamics simulation.
+        Initialize the parallel tempering simulation.
 
         Parameters
         ----------
-        simulation : object
-            The simulation object
-        cvs : list
-            List of collective variables to bias
-        delta_temperature : float
-            Temperature offset for well-tempered metadynamics
-        initial_height : float, optional
-            Initial height of Gaussian hills, default 1.0
-        update_frequency : int, optional
-            Frequency of bias updates in simulation steps, default 1
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
+        simulations : list
+            List of MDSimulations or MCSimulations with different temperatures
+        steps_before_exchange : int, optional
+            Number of steps before attempting an exchange, by default 1
         """
+        super().__init__(multi_sim, steps_before_exchange, compile)
 
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
+    def _calc_acceptance_criterion(self, first_index, second_index):
+        potential_energy_0_0 = self.energy(first_index, first_index)
+        potential_energy_1_1 = self.energy(second_index, second_index)
 
-        self.simulation = simulation
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.initial_height = initial_height
-        self.update_frequency = update_frequency
-        self.periodic_cvs = periodic_cvs
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.current_bias = torch.zeros((self.cv.num_bins))
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_y = self.cvs[1]
-                self.current_bias = torch.zeros((self.cv_x.num_bins, self.cv_y.num_bins))
+        delta_energy_temp = (potential_energy_0_0 - potential_energy_1_1) * (1.0 / self.simulations[first_index].temperature / constants.BOLTZMANN - 1.0 / self.simulations[second_index].temperature / constants.BOLTZMANN)
 
-        force = TabulatedCVForce(cvs, self.current_bias, delta_temperature, periodic_cvs=periodic_cvs)
-        self.simulation.sys.cv_force = force
+        #print("BOLTZMANN CONSTANT: ", constants.BOLTZMANN)
 
-    def get_free_energy(self):
-        """
-        Calculate the current estimate of the free energy surface.
+        # NPT volume term (needed for constant pressure simulations)
+        delta_volume = 0.0
+        simulation_0 = self.simulations[first_index]
+        simulation_1 = self.simulations[second_index]
+        if hasattr(simulation_0, 'barostat') and simulation_0.barostat is not None and \
+           hasattr(simulation_1, 'barostat') and simulation_1.barostat is not None:
+            delta_volume = (simulation_0.barostat.target_pressure / (constants.BOLTZMANN * simulation_0.barostat.target_temperature) - 
+                           simulation_1.barostat.target_pressure / (constants.BOLTZMANN * simulation_1.barostat.target_temperature)) * \
+                          (torch.prod(simulation_0.sys.box) - torch.prod(simulation_1.sys.box))
 
-        Returns
-        -------
-        torch.Tensor
-            The estimated free energy surface
-        """
-        #print(self.current_bias)
-        return - ((self.simulation.temperature + self.delta_temperature) / self.delta_temperature) * self.current_bias
-
-
-    def step(self, update_weights=True):
-        """
-        Perform a metadynamics step.
-
-        Parameters
-        ----------
-        update_weights : bool, optional
-            Whether to update the bias weights, default True
-        """
-        self.simulation.step(self.update_frequency)
-        if update_weights:
-            match len(self.cvs):
-                case 1:
-                    simulation_value_cv = self.cv.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
-
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
-
-                    scaled_value_cv = (simulation_value_cv - self.cv.min_value) / self.cv.box
-                    if self.periodic_cvs:
-                        scaled_value_cv = scaled_value_cv % 1.0
-                    dist = torch.abs(self.cv.scaled_grid_points - scaled_value_cv)
-                    if self.periodic_cvs:
-                        temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                        dist = torch.min(temp_dist, dim=0).values
-                        dist[-1] = dist[0]
-                    add_value = torch.exp(-0.5 * dist * dist / self.cv.scaled_sigma)
-                    self.current_bias = self.current_bias + metad_height * add_value
-                case 2:
-                    simulation_value_cv_x = self.cv_x.measure_cv(self.simulation.pos)
-                    simulation_value_cv_y = self.cv_y.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
-
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
-
-                    cv_add_values = []
-                    for idx, simulation_value_cv in enumerate((simulation_value_cv_x, simulation_value_cv_y)):
-                        scaled_value_cv = (simulation_value_cv - self.cvs[idx].min_value) / self.cvs[idx].box
-                        if self.periodic_cvs:
-                            scaled_value_cv = scaled_value_cv % 1.0
-                        dist = torch.abs(self.cvs[idx].scaled_grid_points - scaled_value_cv)
-                        if self.periodic_cvs:
-                            temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                            dist = torch.min(temp_dist, dim=0).values
-                            dist[-1] = dist[0]
-                        add_value = torch.exp(-0.5 * dist * dist / self.cvs[idx].scaled_sigma)
-                        cv_add_values.append(add_value)
-                    # Reverse order to match OpenMM's reduce(np.multiply.outer, reversed(axisGaussians))
-                    add_values_xy = torch.outer(cv_add_values[1], cv_add_values[0]).T
-                    self.current_bias = self.current_bias + metad_height * add_values_xy
-                case _:
-                    raise NotImplementedError("More than two collective variables are currently not implemented")
-            self.simulation.sys.cv_force.update_data_tensor(self.current_bias.detach())
-            self.current_bias.detach_()
+        acceptance_criterion = torch.exp(delta_energy_temp + delta_volume)
+        return acceptance_criterion

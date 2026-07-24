@@ -439,6 +439,7 @@ class NeighborHandling():
             Memory optimization level (0=none, 1=some, 2=aggressive)
             If None, automatically determined based on system size and available memory
         """
+
         self.periodic = periodic
         self.num_atoms = num_atoms
 
@@ -497,6 +498,8 @@ class NeighborHandling():
             if exclusions is not None and exclusions.size(0) > 0:
                 self.filter_exclusions[exclusions[0], exclusions[1]] = True
                 self.filter_exclusions[exclusions[1], exclusions[0]] = True
+        
+        self.upper_triangle = None #placeholder for memory when needed
 
     def update_box(self, box):
         """
@@ -514,14 +517,17 @@ class NeighborHandling():
         Exception
             If called for non-periodic system
         """
-        if torch.any(box / 2 < self.cutoff):
+        if torch.any(box[:3] / 2 < self.cutoff):
             raise ValueError("Box/2 cannot be smaller than cutoff+skin")
         if self.periodic:
             self.box = box
-            self.num_cells = torch.ceil(self.box / self.cutoff).int()
-            self.cell_size = self.box / self.num_cells
+            # Cell list is always computed in 3D (physical dimensions)
+            box_3d = box[:3]
+            self.num_cells = torch.floor(box_3d / self.cutoff).to(torch.int64)
+            self.cell_size = box_3d / self.num_cells
             self.total_num_cells = torch.prod(self.num_cells)
-            self.shifts = self.calculate_neighboring_cells_periodic_half()
+            if not (self.num_cells <= 2).any():
+                self.shifts = self.calculate_neighboring_cells_periodic_half()
         else:
             raise Exception(
                 "Update box is currently only implemented for the use within barostats. Setting a box for a non-periodic system thus does not make sense.")
@@ -529,6 +535,10 @@ class NeighborHandling():
     def get_neighborlist(self, pos):
         """
         Build a new neighbor list from scratch.
+
+        For d > 3, the 3D cell list algorithm is used first (since d-dimensional
+        distances are always >= 3D distances, the 3D neighbor list is a superset),
+        then pairs are re-screened using full d-dimensional distances.
 
         Parameters
         ----------
@@ -540,11 +550,43 @@ class NeighborHandling():
         torch.Tensor
             Neighbor list as pairs of atom indices
         """
-        cell_list = self.from_scratch(pos)
-        if self.periodic:
-            self.neighborlist = self.build_neighborlist_from_cell_list(pos, cell_list)
+        # For non-periodic systems, self.num_cells is unknown until from_scratch
+        # computes the bounding box from the current positions via
+        # set_information_cell_non_periodic.  Call from_scratch first so that
+        # self.num_cells is populated before the cell-count guard is evaluated.
+        if not self.periodic:
+            cell_list = self.from_scratch(pos[:, :3])
+
+        if not (self.num_cells <= 2).any():
+            if self.periodic:
+                cell_list = self.from_scratch(pos[:,:3])
+
+            if pos.size(1) > 3 and self.box.size(0) == pos.size(1):
+                # For d > 3 with a d-dim box (non-separable hyperspatial case),
+                # build neighbor list using 3D cell list (guaranteed superset
+                # since r_dD >= r_3D), then screen once with full d-dim distances.
+                if self.periodic:
+                    self.neighborlist = self.build_neighborlist_from_cell_list(pos[:,:3], cell_list, filter_for_distance=False)
+                else:
+                    self.neighborlist = self.build_neighborlist_from_cell_list_loop(pos[:,:3], cell_list, filter_for_distance=False)
+
+                # Single screening pass with full d-dimensional distances
+                distances_full = get_distances_edge_list(pos, self.neighborlist, self.periodic, self.box)
+                self.neighborlist = self.neighborlist[:, distances_full <= self.cutoff]
+
+                # Store full-dimensional positions for check_recalc
+                self.original_pos = pos.clone()
+            else:
+                if self.periodic:
+                    self.neighborlist = self.build_neighborlist_from_cell_list(pos[:,:3], cell_list)
+                else:
+                    self.neighborlist = self.build_neighborlist_from_cell_list_loop(pos[:,:3], cell_list)
         else:
-            self.neighborlist = self.build_neighborlist_from_cell_list_loop(pos, cell_list)
+            warn("Activated fallback to neighborlist from distance matrix because number of cells got too small")
+            if self.box is not None and self.box.size(0) == pos.size(1):
+                self.neighborlist = self.build_neighborlist_from_full_distance_matrix(pos)
+            else:
+                self.neighborlist = self.build_neighborlist_from_full_distance_matrix(pos[:,:3])
 
         return self.neighborlist
 
@@ -558,7 +600,7 @@ class NeighborHandling():
             Linear indices of neighboring cells for each cell, considering only "forward" neighbors
             to avoid double counting
         """
-        neighbor_shifts_half = torch.tensor([
+        neighbor_shifts_half =  torch.tensor([
             [-1, -1, -1], [-1, -1, 0], [-1, -1, 1],
             [-1, 0, -1], [-1, 0, 0], [-1, 0, 1],
             [-1, 1, -1], [-1, 1, 0], [-1, 1, 1],
@@ -569,8 +611,7 @@ class NeighborHandling():
         i, j, k = torch.meshgrid(torch.arange(self.num_cells[0]), torch.arange(self.num_cells[1]), torch.arange(self.num_cells[2]), indexing='ij')
         linear_index_current_cell = i * self.num_cells[1] * self.num_cells[2] + j * self.num_cells[2] + k
         neighbor_indices = (torch.stack((i, j, k), dim=-1).reshape(-1, 3)[:, None, :] + neighbor_shifts_half) % self.num_cells
-        linear_neighbor_indices = neighbor_indices[..., 0] * self.num_cells[1] * self.num_cells[2] + \
-            neighbor_indices[..., 1] * self.num_cells[2] + neighbor_indices[..., 2]
+        linear_neighbor_indices = neighbor_indices[..., 0] * self.num_cells[1] * self.num_cells[2] + neighbor_indices[..., 1] * self.num_cells[2] + neighbor_indices[..., 2]
 
         linear_shifts = linear_neighbor_indices[linear_index_current_cell].reshape(torch.prod(self.num_cells), -1)
 
@@ -702,7 +743,12 @@ class NeighborHandling():
 
         self.box = max_pos.values + self.epsilon_non_periodic
 
-        self.num_cells = torch.ceil(self.box / self.cutoff).to(torch.int64)
+        # Clamp to at least 1 so that cell_size = box / num_cells is always
+        # finite and total_num_cells > 0.  Any dimension with num_cells <= 2
+        # will trigger the distance-matrix fallback in get_neighborlist.
+        self.num_cells = torch.clamp(
+            torch.floor(self.box / self.cutoff).to(torch.int64), min=1
+        )
         self.cell_size = self.box / self.num_cells
         self.total_num_cells = torch.prod(self.num_cells)
         self.linear_shifts = self.calculate_neighboring_cells_non_periodic()
@@ -729,6 +775,7 @@ class NeighborHandling():
 
         return torch.linalg.vector_norm(pos_dist, dim=1)
 
+    #TODO: Check if this actually does something
     def check_recalc(self, pos: torch.Tensor) -> torch.Tensor:
         """
         Check if neighbor list needs to be rebuilt and rebuild if necessary.
@@ -743,12 +790,17 @@ class NeighborHandling():
         torch.Tensor
             Current neighbor list, rebuilt if needed
         """
-        moved_distance = self.get_moved_distance_since_last_update(pos)
+        # TODO: This 3 is a bit ugly...
+        if self.box.size(0)==3:
+            moved_distance = self.get_moved_distance_since_last_update(pos[:,:3])
+        else:
+            moved_distance = self.get_moved_distance_since_last_update(pos)
 
         if torch.any(moved_distance >= self.half_skin):
             self.neighborlist = self.get_neighborlist(pos)
 
         return self.neighborlist
+    
 
     def build_neighborlist_from_cell_list_loop(self, pos: torch.Tensor, cell_list: torch.Tensor, filter_for_distance=True) -> torch.Tensor:
         """
@@ -802,10 +854,10 @@ class NeighborHandling():
             # and append to to final result tensor
             results.append(result)
 
-        self.neighborlist = torch.cat(results).T
+        neighborlist = torch.cat(results).T
 
         if self.save_memory:
-            sorted_neighbors, _ = torch.sort(self.neighborlist, dim=0)  # Ensure i <= j
+            sorted_neighbors, _ = torch.sort(neighborlist, dim=0)  # Ensure i <= j
             neighbor_keys = sorted_neighbors[0] * self.num_atoms + sorted_neighbors[1]
             neighbor_keys = neighbor_keys.to(torch.int64)
 
@@ -813,16 +865,16 @@ class NeighborHandling():
             idx = torch.searchsorted(self.exclusion_keys, neighbor_keys)
             mask_exclusions = (idx < len(self.exclusion_keys)) & (self.exclusion_keys[idx] == neighbor_keys)
         else:
-            mask_exclusions = self.filter_exclusions[self.neighborlist[0], self.neighborlist[1]]
+            mask_exclusions = self.filter_exclusions[neighborlist[0], neighborlist[1]]
 
-        self.neighborlist = self.neighborlist.T[~mask_exclusions].T
+        neighborlist = neighborlist[:, ~mask_exclusions]
 
         if filter_for_distance:
-            distance_matrix = get_distances_edge_list(pos, self.neighborlist, self.periodic, self.box)
+            distance_matrix = get_distances_edge_list(pos, neighborlist, self.periodic, self.box)
             first_mask = distance_matrix <= self.cutoff
-            self.neighborlist = self.neighborlist[:, first_mask]
+            neighborlist = neighborlist[:, first_mask]
 
-        return self.neighborlist
+        return neighborlist
 
     @torch.compiler.disable(recursive=True)
     def build_neighborlist_from_cell_list(self, pos: torch.Tensor, cell_list: torch.Tensor, filter_for_distance=True) -> torch.Tensor:
@@ -858,11 +910,11 @@ class NeighborHandling():
         result2 = self.batched_cartesian_prod(cell_list, cell_list[self.shifts].flatten(1, 2))
         result2 = result2[~((result2[:, :, 0] == -1) | (result2[:, :, 1] == -1))]
 
-        self.neighborlist = torch.cat((result1, result2)).T
+        neighborlist = torch.cat((result1, result2)).T
         del result1, result2
 
         if self.save_memory:
-            sorted_neighbors, _ = torch.sort(self.neighborlist, dim=0)  # Ensure i <= j
+            sorted_neighbors, _ = torch.sort(neighborlist, dim=0)  # Ensure i <= j
             neighbor_keys = sorted_neighbors[0] * self.num_atoms + sorted_neighbors[1]
             del sorted_neighbors
 
@@ -873,17 +925,53 @@ class NeighborHandling():
             mask_exclusions = (idx < len(self.exclusion_keys)) & (self.exclusion_keys[idx] == neighbor_keys)
             del idx, neighbor_keys
         else:
-            mask_exclusions = self.filter_exclusions[self.neighborlist[0], self.neighborlist[1]]
+            mask_exclusions = self.filter_exclusions[neighborlist[0], neighborlist[1]]
 
-        self.neighborlist = self.neighborlist.T[~mask_exclusions].T
+        neighborlist = neighborlist[:, ~mask_exclusions]
         del mask_exclusions
 
         if filter_for_distance:
-            self.neighborlist = self.neighborlist[:, get_distances_edge_list(pos, self.neighborlist, self.periodic, self.box) <= self.cutoff]
+            neighborlist = neighborlist[:, get_distances_edge_list(pos, neighborlist, self.periodic, self.box) <= self.cutoff]
 
         if self.save_memory == 2:
-            self.neighborlist = self.neighborlist.to(torch.get_default_device())
+            neighborlist = neighborlist.to(torch.get_default_device())
             pos = pos.to(torch.get_default_device())
             self.box = self.box.to(torch.get_default_device())
 
-        return self.neighborlist
+        return neighborlist
+    
+
+    # Mainly used as fallback if d!=3 :)
+    def build_neighborlist_from_full_distance_matrix(self, pos: torch.Tensor, filter_for_distance=True):
+        """
+        Build the neighbor list from the full distance matrix.
+
+        Parameters
+        ----------
+        pos : torch.Tensor
+            The positions of the atoms.
+
+        Returns
+        -------
+        torch.Tensor
+            The neighbor list.
+        """
+
+        print("Rebuild Neighborlist from full distance matrix fallback.")
+        self.original_pos = pos.clone()
+
+        if self.upper_triangle is None:
+            self.upper_triangle = torch.triu_indices(self.num_atoms, self.num_atoms, offset=1)
+
+        if self.cutoff is not None and filter_for_distance:
+            distance_matrix = get_distances_edge_list(pos, self.upper_triangle, self.periodic, self.box)
+
+            mask_cutoff = distance_matrix <= self.cutoff
+            valid_pairs = self.upper_triangle[:, mask_cutoff]
+        else:
+            valid_pairs = self.upper_triangle
+        
+        mask_exclusions = self.filter_exclusions[valid_pairs[0], valid_pairs[1]]
+        neighborlist = valid_pairs[:, ~mask_exclusions]
+
+        return neighborlist

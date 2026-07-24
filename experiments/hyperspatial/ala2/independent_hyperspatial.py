@@ -369,478 +369,370 @@
 # document relating to these Terms shall prevail over any translation and any 
 # version in any other language.
 
-
-
 """
-Metadynamics enhanced sampling module.
+Independent Hyperspatial Simulations for Alanine Dipeptide in Solvent (Protein-Only Penalty).
 
-This module provides implementations of metadynamics-based enhanced sampling methods
-for molecular simulations. Metadynamics is an advanced sampling technique that adds
-history-dependent bias potentials along collective variables to help systems escape
-from local free energy minima and explore broader regions of configuration space.
+This script runs independent hyperspatial simulations at different mu values
+WITHOUT replica exchange. This serves as a baseline comparison for HREX simulations.
 
-The module contains the following main classes:
+The hyperspatial penalty (mu) is applied ONLY to the protein atoms, not to the 
+solvent. Solvent atoms have mu=0 (or a specified solvent_mu), meaning they are 
+free to move in the extra dimensions without penalty.
 
-- CollectiveVariable: Base class for defining collective variables
-- DihedralCV: Implementation of dihedral angle collective variable 
-- TabulatedCVForce: Handler for tabulated biasing forces
-- Metadynamics: Implementation of well-tempered metadynamics
+Each simulation runs independently at a fixed mu value, allowing comparison of:
+- Sampling efficiency at different mu values
+- Conformational exploration without exchange assistance
+- Barrier crossing rates at different penalty strengths
 
-These classes enable enhanced sampling simulations using one or two collective 
-variables, with support for periodic and non-periodic variables. The implementation
-includes well-tempered metadynamics to control the growth of the bias potential.
+Usage:
+    python independent_hyperspatial.py [--num_extra_dim N] [--dihedral_method METHOD]
+    
+Example:
+    python independent_hyperspatial.py
+    python independent_hyperspatial.py --num_extra_dim 2
+    python independent_hyperspatial.py --dihedral_method 3d
 
-Note: This is currently an experimental feature and should be used with caution.
+Output files:
+- coordinates_*.pdb: Trajectories for each mu value (3D projection)
+- config.json: Simulation parameters in each output directory
 """
 
+import argparse
+import os
+import json
+from datetime import datetime
 import torch
-from warnings import warn
+import parmed
 
-from dimos.splines import OneDimensionalSpline, TwoDimensionalSpline
-from dimos.utils import get_distance_vectors
-from dimos import constants
+import dimos
+from dimos.simulation import MDSimulation
+from dimos.integrators import LangevinDynamics
+from dimos.advanced_methods.hyperspatial_utils import HyperspatialSystem
+from dimos.batching import MultiSim
+
+torch.set_default_device("cuda:2")
+torch.set_default_dtype(torch.float64)
+
+# =============================================================================
+# Parse command line arguments
+# =============================================================================
+parser = argparse.ArgumentParser(description="Run independent hyperspatial simulations at multiple mu values (protein-only penalty)")
+parser.add_argument("--num_extra_dim", type=int, default=1, help="Number of extra dimensions (default: 1)")
+parser.add_argument("--dihedral_method", type=str, default="nd", choices=["auto", "nd", "3d", "7d", "clifford"],
+                    help="Dihedral calculation method: 'nd' for N-dimensional, '3d' for projected (default: nd)")
+parser.add_argument("--compile", action="store_true", help="Compile step functions for performance")
+args = parser.parse_args()
+
+num_extra_dim = args.num_extra_dim
+dihedral_method = args.dihedral_method
+
+# Set the global dihedral calculation method
+dimos.utils.set_dihedral_method(dihedral_method)
+
+# =============================================================================
+# Configuration
+# =============================================================================
+# List of mu values to simulate (including one for the separable system)
+# These should match or be a subset of your HREX mu_values for comparison
+mu_values = [2000.0, 1000.0, 500.0, 100.0, 50.0, 10.0, 5.0, 1.0, 0.1, 0.01]
+
+config = {
+    # Simulation parameters
+    "n_steps": 10_000_000,         # Total MD steps per simulation
+    "equilibration_steps": 0,
+    "output_interval": 1000,       # Steps between PDB snapshots
+    "stats_interval": 10000,       # Steps between statistics output
+    
+    # Hyperspatial parameters
+    "num_extra_dim": num_extra_dim,
+    "dihedral_method": dihedral_method,
+    "mu_values": mu_values,
+    "noise_amplitude": 0.1,        # Initial noise in extra dimensions
+    "protein_only_penalty": True,  # Apply penalty only to protein
+    "solvent_mu": mu_values[0],    # Solvent mu (set to highest protein mu for comparison)
+    
+    # Integrator parameters
+    "timestep": 0.5,               # femtoseconds
+    "temperature": 298.0,          # Kelvin
+    "friction": 0.001,             # collision rate in 1/fs (= 1/ps)
+    
+    # Force field parameters (for solvated system with periodic boundary conditions)
+    "nonbonded_type": "Cutoff",    # Use cutoff for periodic system
+    "periodic": True,
+    "cutoff": 9.5,                 # Angstroms
+    "switch_distance": 8.0,        # Angstroms
+    
+    # Input files (equilibrated NPT structure)
+    "topology_file": "ala2.top",
+    "coordinate_file": "ala2_npt.gro",
+}
+
+# =============================================================================
+# Create base output directory
+# =============================================================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+base_output_dir = f"independent_{timestamp}_d{num_extra_dim}_{dihedral_method}_protonly"
+os.makedirs(base_output_dir, exist_ok=True)
+
+# Save master configuration
+master_config_path = os.path.join(base_output_dir, "config.json")
+with open(master_config_path, "w") as f:
+    json.dump(config, f, indent=4)
+
+print(f"Base output directory: {base_output_dir}")
+print(f"Master configuration saved to: {master_config_path}")
 
 
-class CollectiveVariable():
+# =============================================================================
+# Utility function to identify protein atoms
+# =============================================================================
+def get_protein_mask(topology_file, coordinate_file):
     """
-    Base class for collective variables used in metadynamics simulations.
-
-    This class provides the foundation for implementing collective variables (CVs) that
-    describe the degrees of freedom along which enhanced sampling is performed.
-
+    Create a boolean mask identifying protein atoms (non-solvent).
+    
+    Uses ParmEd to analyze the topology and identify molecules.
+    Assumes the first molecule is the protein and all subsequent
+    3-atom molecules are water/solvent.
+    
     Parameters
     ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    sigma : float
-        Width parameter for Gaussian hills
-    num_bins : int, optional
-        Number of bins for discretizing the CV space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma) following
-        the OpenMM convention.
-
-    Attributes
-    ----------
-    min_value : float
-        Minimum value of the collective variable
-    max_value : float
-        Maximum value of the collective variable
-    num_bins : int
-        Number of bins for discretizing the CV space
-    bin_width : float
-        Width of each bin in the discretized space
-    box : float
-        Total range of the CV (max_value - min_value)
-    scaled_sigma : float
-        Squared sigma parameter scaled by box size
-    scaled_grid_points : torch.Tensor
-        Evenly spaced points between 0 and 1 for the scaled CV space
+    topology_file : str
+        Path to GROMACS topology file (.top)
+    coordinate_file : str
+        Path to coordinate file (.gro)
+        
+    Returns
+    -------
+    protein_mask : torch.Tensor
+        Boolean tensor with True for protein atoms, False for solvent
+    n_protein_atoms : int
+        Number of protein atoms
+    n_total_atoms : int
+        Total number of atoms in the system
     """
+    # Load the topology with parmed
+    structure = parmed.load_file(topology_file, xyz=coordinate_file)
+    
+    # Use parmed's molecule tagging to identify molecules
+    molecules = parmed.utils.tag_molecules(structure)
+    
+    n_total_atoms = len(structure.atoms)
+    protein_mask = torch.zeros(n_total_atoms, dtype=torch.bool)
+    
+    # Find the protein molecule (should be the first and largest non-water molecule)
+    protein_atoms = set()
+    for mol in molecules:
+        mol_atoms = list(mol)
+        # Assume protein is any molecule with more than 3 atoms (water has 3)
+        if len(mol_atoms) > 3:
+            protein_atoms.update(mol_atoms)
+    
+    # Create the mask
+    for atom_idx in protein_atoms:
+        protein_mask[atom_idx] = True
+    
+    n_protein_atoms = len(protein_atoms)
 
-    def __init__(self, min_value, max_value, sigma, num_bins=None):
-        """
-        Initialize the collective variable.
-
-        Parameters
-        ----------
-        min_value : float
-            Minimum value of the collective variable
-        max_value : float
-            Maximum value of the collective variable
-        sigma : float
-            Width parameter for Gaussian hills
-        num_bins : int, optional
-            Number of bins for discretizing the CV space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma) following
-            the OpenMM convention.
-        """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.min_value = min_value
-        self.max_value = max_value
-        self.box = max_value - min_value
-        if num_bins is None:
-            # Default grid width following OpenMM convention: 5 bins per sigma
-            self.num_bins = int(torch.ceil(torch.tensor(5 * self.box / sigma)).item())
-        else:
-            self.num_bins = num_bins
-        self.bin_width = self.box / self.num_bins
-        self.scaled_sigma = (sigma / self.box)**2
-        self.scaled_grid_points = torch.linspace(0.0, 1.0, self.num_bins)
-
-    def measure_cv(self, simulation):
-        """
-        Measure the value of the collective variable.
-
-        Parameters
-        ----------
-        simulation : object
-            The simulation object containing system state
-
-        Raises
-        ------
-        NotImplementedError
-            This is a base class method that must be implemented by derived classes
-        """
-        raise NotImplementedError()
+    return protein_mask, n_protein_atoms, n_total_atoms
 
 
-class DihedralCV(CollectiveVariable):
-    """
-    Collective variable for dihedral angles.
+# =============================================================================
+# Get protein mask
+# =============================================================================
+protein_mask, n_protein_atoms, n_total_atoms = get_protein_mask(
+    config["topology_file"], 
+    config["coordinate_file"]
+)
 
-    This class implements a collective variable based on dihedral angles defined by
-    four atoms. It inherits from the CollectiveVariable base class.
+print(f"\n{'='*60}")
+print(f"Protein-Solvent Analysis:")
+print(f"  Total atoms: {n_total_atoms}")
+print(f"  Protein atoms: {n_protein_atoms}")
+print(f"  Solvent atoms: {n_total_atoms - n_protein_atoms}")
+print(f"  Hyperspatial penalty applied ONLY to protein atoms")
+print(f"{'='*60}")
 
-    Parameters
-    ----------
-    four_pair_atoms : list
-        List of four atom indices defining the dihedral angle
-    min_value : float
-        Minimum value of the dihedral angle
-    max_value : float
-        Maximum value of the dihedral angle
-    sigma : float
-        Width parameter for Gaussian hills
-    system : object
-        System object containing simulation parameters
-    num_bins : int, optional
-        Number of bins for discretizing the dihedral space. If None, automatically
-        calculated as ceil(5 * (max_value - min_value) / sigma).
+# =============================================================================
+# Create output directories for each mu value
+# =============================================================================
+output_dirs = []
+for mu in mu_values:
+    output_dir = os.path.join(base_output_dir, f"mu_{mu}")
+    os.makedirs(output_dir, exist_ok=True)
+    output_dirs.append(output_dir)
+    
+    # Save configuration for this mu
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump({**config, "mu": mu}, f, indent=4)
 
-    Attributes
-    ----------
-    cv_atoms : list
-        List of four atoms defining the dihedral angle
-    system : object
-        Reference to the system object
-    """
+print(f"\nOutput directories created for {len(mu_values)} mu values")
 
-    def __init__(self, four_pair_atoms, min_value, max_value, sigma, system, num_bins=None):
-        """
-        Initialize the dihedral collective variable.
+# =============================================================================
+# Create individual simulations for each mu value
+# =============================================================================
+print(f"\n{'='*60}")
+print(f"Setting up {len(mu_values)} independent simulations")
+print(f"mu values (protein): {mu_values}")
+print(f"solvent_mu: {config['solvent_mu']}")
+print(f"Number of extra dimensions: {num_extra_dim}")
+print(f"{'='*60}")
 
-        Parameters
-        ----------
-        four_pair_atoms : list
-            List of four atom indices defining the dihedral angle
-        min_value : float
-            Minimum value of the dihedral angle
-        max_value : float
-            Maximum value of the dihedral angle
-        sigma : float
-            Width parameter for Gaussian hills
-        system : object
-            System object containing simulation parameters
-        num_bins : int, optional
-            Number of bins for discretizing the dihedral space. If None, automatically
-            calculated as ceil(5 * (max_value - min_value) / sigma).
-        """
-        super().__init__(min_value, max_value, sigma, num_bins)
-        self.cv_atoms = four_pair_atoms
-        self.system = system
+simulations = []
 
-    def measure_cv(self, pos):
-        """
-        Calculate the dihedral angle for the current configuration.
+# Create HyperspatialSystem for each mu value
+for idx, mu in enumerate(mu_values):
+    print(f"  Setting up HyperspatialSystem simulation {idx+1} with mu = {mu} (protein only)...")
+    
+    positions = dimos.utils.read_positions(config["coordinate_file"])
+    positions = torch.nn.functional.pad(positions, (0, config["num_extra_dim"]), value=0.0)
+    positions[:, 3:] = torch.randn_like(positions[:, 3:]) * config["noise_amplitude"]
+    
+    base_system = dimos.GromacsForceField(
+        config["topology_file"],
+        config["coordinate_file"],
+        periodic=config["periodic"],
+        nonbonded_type=config["nonbonded_type"],
+        cutoff=config["cutoff"],
+        switch_distance=config["switch_distance"],
+    )
+    
+    # Use tuple (protein_mu, solvent_mu) with protein_mask
+    hyper_system = HyperspatialSystem(
+        system=base_system,
+        num_extra_dim=config["num_extra_dim"],
+        penalty_extra_dim=(mu, config["solvent_mu"]),
+        protein_mask=protein_mask,
+    )
+    
+    integrator = LangevinDynamics(
+        timestep=config["timestep"],
+        temperature=config["temperature"],
+        friction=config["friction"],
+        sys=hyper_system
+    )
+    
+    simulation = MDSimulation(
+        sys=hyper_system,
+        integrator=integrator,
+        initial_pos=positions.clone(),
+        temperature=config["temperature"],
+    )
+    
+    simulations.append(simulation)
 
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
+# =============================================================================
+# Create batched multi-simulation for efficiency
+# =============================================================================
+print(f"\nCreating batched simulation for {len(simulations)} systems...")
+multi_sim = MultiSim(simulations)
 
-        Returns
-        -------
-        torch.Tensor
-            The calculated dihedral angle
-        """
-        v1 = get_distance_vectors(pos, [self.cv_atoms[0], self.cv_atoms[1]], self.system.periodic, self.system.box)
-        v2 = get_distance_vectors(pos, [self.cv_atoms[1], self.cv_atoms[2]], self.system.periodic, self.system.box)
-        v3 = get_distance_vectors(pos, [self.cv_atoms[2], self.cv_atoms[3]], self.system.periodic, self.system.box)
+num_sims = len(simulations)
 
-        crossv1 = torch.linalg.cross(v1, v2)
-        crossv2 = torch.linalg.cross(v2, v3)
-        crossv3 = torch.linalg.cross(v2, crossv1)
+# Output PDB files: one for each mu value
+pdb_filenames = [os.path.join(output_dir, "coordinates.pdb") for output_dir in output_dirs]
 
-        normv1 = torch.linalg.vector_norm(crossv1)
-        normv2 = torch.linalg.vector_norm(crossv2)
-        normv3 = torch.linalg.vector_norm(crossv3)
+# Statistics log file
+stats_log_file = os.path.join(base_output_dir, "statistics_log.txt")
 
-        normcrossv2 = crossv2 / normv2
+# =============================================================================
+# Initialize statistics log
+# =============================================================================
+with open(stats_log_file, 'w') as f:
+    f.write(f"Independent Hyperspatial Simulations Statistics Log (Protein-Only Penalty)\n")
+    f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"mu_values: {mu_values}\n")
+    f.write(f"solvent_mu: {config['solvent_mu']}\n")
+    f.write(f"num_extra_dim: {num_extra_dim}\n")
+    f.write(f"dihedral_method: {dihedral_method}\n")
+    f.write(f"System: Alanine dipeptide in solvent (periodic)\n")
+    f.write(f"Protein atoms: {n_protein_atoms}, Solvent atoms: {n_total_atoms - n_protein_atoms}\n")
+    f.write(f"Number of simulations: {num_sims}\n")
+    f.write(f"{'='*80}\n\n")
 
-        cos_phi = torch.sum(crossv1 * normcrossv2) / normv1
-        sin_phi = torch.sum(crossv3 * normcrossv2) / normv3
-        phi = -torch.atan2(sin_phi, cos_phi)
+# =============================================================================
+# Run independent simulations
+# =============================================================================
+print(f"\n{'='*60}")
+print(f"Running Independent Hyperspatial Simulations (Protein-Only Penalty)")
+print(f"Total MD steps: {config['n_steps']}")
+print(f"Saving coordinates every {config['output_interval']} steps")
+print(f"Statistics output every {config['stats_interval']} steps")
+print(f"{'='*60}")
 
-        return phi
+n_outputs = config["n_steps"] // config["output_interval"]
+stats_outputs = config["n_steps"] // config["stats_interval"]
 
+for i in range(n_outputs):
+    current_step = (i + 1) * config["output_interval"]
+    
+    # Run dynamics
+    multi_sim.step(config["output_interval"])
+    
+    # Write coordinates for each simulation
+    for idx in range(num_sims):
+        pos = multi_sim.get_pos(idx)
+        pos_3d = pos[:, :3]
+        
+        # Get the base system for writing
+        multi_sim.sys.systems[idx].sys.write_config(pos_3d, pdb_filenames[idx], unwrap=False)
+    
+    # Statistics output
+    if current_step % config["stats_interval"] == 0:
+        lines = []
+        lines.append(f"\n{'='*80}")
+        lines.append(f"Step {current_step}/{config['n_steps']} ({100*current_step/config['n_steps']:.2f}%)")
+        lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"{'-'*80}")
+        lines.append("Simulation Statistics:")
+        lines.append(f"{'Sim':>5} {'mu':>10} {'Prot ExtraRMS':>14} {'Solv ExtraRMS':>14}")
+        lines.append(f"{'-'*50}")
+        
+        for idx in range(num_sims):
+            pos = multi_sim.get_pos(idx)
+            extra_coords = pos[:, 3:]
+            
+            # Separate RMS for protein and solvent
+            prot_extra = extra_coords[protein_mask]
+            solv_extra = extra_coords[~protein_mask]
+            
+            prot_rms = torch.sqrt(torch.mean(prot_extra ** 2)).item() if prot_extra.numel() > 0 else 0.0
+            solv_rms = torch.sqrt(torch.mean(solv_extra ** 2)).item() if solv_extra.numel() > 0 else 0.0
+            
+            mu_label = f"{mu_values[idx]:.2f}"
+            
+            lines.append(f"{idx:>5} {mu_label:>10} {prot_rms:>14.4f} {solv_rms:>14.4f}")
+        
+        lines.append(f"{'='*80}\n")
+        
+        # Output to terminal
+        for line in lines:
+            print(line)
+        
+        # Append to log file
+        with open(stats_log_file, 'a') as f:
+            for line in lines:
+                f.write(line + "\n")
 
-class TabulatedCVForce():
-    """
-    Class for handling tabulated forces from collective variables.
+# =============================================================================
+# Final summary
+# =============================================================================
+print(f"\n{'='*60}")
+print(f"Independent simulations complete (Protein-Only Penalty).")
+print(f"Results saved to: {base_output_dir}")
+print(f"{'='*60}")
 
-    This class manages the biasing forces applied along collective variables using
-    spline interpolation of tabulated values.
+# Print summary of output files
+print("\nOutput files:")
+for i, (mu, pdb_file) in enumerate(zip(mu_values, pdb_filenames)):
+    print(f"  mu={mu} (protein), mu={config['solvent_mu']} (solvent): {pdb_file}")
+print(f"  Statistics log: {stats_log_file}")
+print(f"  Master configuration: {master_config_path}")
 
-    Parameters
-    ----------
-    cvs : list
-        List of collective variable objects
-    data_tensor : torch.Tensor
-        Tensor containing the tabulated force data
-    delta_temperature : float
-        Temperature offset for metadynamics
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
-
-    Attributes
-    ----------
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    cv_from_spline : OneDimensionalSpline or TwoDimensionalSpline
-        Spline interpolator for the CV forces
-    """
-
-    def __init__(self, cvs, data_tensor, delta_temperature, periodic_cvs=True):
-        """
-        Initialize the tabulated CV force handler.
-
-        Parameters
-        ----------
-        cvs : list
-            List of collective variable objects
-        data_tensor : torch.Tensor
-            Tensor containing the tabulated force data
-        delta_temperature : float
-            Temperature offset for metadynamics
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
-        """
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.periodic_cvs = periodic_cvs
-
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.cv_bins = torch.linspace(self.cv.min_value, self.cv.max_value, self.cv.num_bins)
-                self.cv_from_spline = OneDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=periodic_cvs)
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_x_bins = torch.linspace(self.cv_x.min_value, self.cv_x.max_value, self.cv_x.num_bins)
-                self.cv_y = self.cvs[1]
-                self.cv_y_bins = torch.linspace(self.cv_y.min_value, self.cv_y.max_value, self.cv_y.num_bins)
-                self.cv_from_spline = TwoDimensionalSpline()
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def __str__(self):
-        """
-        Get string representation.
-
-        Returns
-        -------
-        str
-            Description of the tabulated CV force
-        """
-        return "Tabulated CV"
-
-    def update_data_tensor(self, data_tensor):
-        """
-        Update the tabulated force data.
-
-        Parameters
-        ----------
-        data_tensor : torch.Tensor
-            New force data tensor
-        """
-        match len(self.cvs):
-            case 1:
-                self.cv_from_spline.initialize_spline(self.cv_bins, data_tensor, periodic=self.periodic_cvs)
-            case 2:
-                self.cv_from_spline.initialize_spline(self.cv_x_bins, self.cv_y_bins, data_tensor, periodic=self.periodic_cvs)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-
-    def calc_energy(self, pos):
-        """
-        Calculate the bias energy for the current configuration.
-
-        Parameters
-        ----------
-        pos : torch.Tensor
-            Current atomic positions
-
-        Returns
-        -------
-        torch.Tensor
-            The calculated bias energy
-        """
-        match len(self.cvs):
-            case 1:
-                simulation_value_cv = self.cv.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv)
-            case 2:
-                simulation_value_cv_x = self.cv_x.measure_cv(pos)
-                simulation_value_cv_y = self.cv_y.measure_cv(pos)
-                B = self.cv_from_spline.evaluate_spline(simulation_value_cv_x, simulation_value_cv_y)
-            case _:
-                raise NotImplementedError("More than two collective variables are currently not implemented")
-        energy = B
-        return energy
-
-
-class Metadynamics:
-    """
-    Implementation of metadynamics enhanced sampling.
-
-    This class implements well-tempered metadynamics for enhanced sampling along one or two
-    collective variables. It adds Gaussian bias potentials to help the system escape from
-    local free energy minima.
-
-    Parameters
-    ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables to bias
-    delta_temperature : float
-        Temperature offset for well-tempered metadynamics
-    initial_height : float, optional
-        Initial height of Gaussian hills, default 1.0
-    update_frequency : int, optional
-        Frequency of bias updates in simulation steps, default 1
-    periodic_cvs : bool, optional
-        Whether the CVs are periodic, default True
-
-    Attributes
-    ----------
-    simulation : object
-        The simulation object
-    cvs : list
-        List of collective variables
-    delta_temperature : float
-        Temperature offset parameter
-    initial_height : float
-        Initial height of Gaussian hills
-    update_frequency : int
-        Frequency of bias updates
-    periodic_cvs : bool
-        Whether CVs are periodic
-    current_bias : torch.Tensor
-        Current accumulated bias potential
-    """
-
-    def __init__(self, simulation, cvs, delta_temperature, initial_height=1.0, update_frequency=1, periodic_cvs=True):
-        """
-        Initialize metadynamics simulation.
-
-        Parameters
-        ----------
-        simulation : object
-            The simulation object
-        cvs : list
-            List of collective variables to bias
-        delta_temperature : float
-            Temperature offset for well-tempered metadynamics
-        initial_height : float, optional
-            Initial height of Gaussian hills, default 1.0
-        update_frequency : int, optional
-            Frequency of bias updates in simulation steps, default 1
-        periodic_cvs : bool, optional
-            Whether the CVs are periodic, default True
-        """
-
-        warn("Metadynamics is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
-
-        self.simulation = simulation
-        self.cvs = cvs
-        self.delta_temperature = delta_temperature
-        self.initial_height = initial_height
-        self.update_frequency = update_frequency
-        self.periodic_cvs = periodic_cvs
-        match len(self.cvs):
-            case 1:
-                self.cv = self.cvs[0]
-                self.current_bias = torch.zeros((self.cv.num_bins))
-            case 2:
-                self.cv_x = self.cvs[0]
-                self.cv_y = self.cvs[1]
-                self.current_bias = torch.zeros((self.cv_x.num_bins, self.cv_y.num_bins))
-
-        force = TabulatedCVForce(cvs, self.current_bias, delta_temperature, periodic_cvs=periodic_cvs)
-        self.simulation.sys.cv_force = force
-
-    def get_free_energy(self):
-        """
-        Calculate the current estimate of the free energy surface.
-
-        Returns
-        -------
-        torch.Tensor
-            The estimated free energy surface
-        """
-        #print(self.current_bias)
-        return - ((self.simulation.temperature + self.delta_temperature) / self.delta_temperature) * self.current_bias
-
-
-    def step(self, update_weights=True):
-        """
-        Perform a metadynamics step.
-
-        Parameters
-        ----------
-        update_weights : bool, optional
-            Whether to update the bias weights, default True
-        """
-        self.simulation.step(self.update_frequency)
-        if update_weights:
-            match len(self.cvs):
-                case 1:
-                    simulation_value_cv = self.cv.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
-
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
-
-                    scaled_value_cv = (simulation_value_cv - self.cv.min_value) / self.cv.box
-                    if self.periodic_cvs:
-                        scaled_value_cv = scaled_value_cv % 1.0
-                    dist = torch.abs(self.cv.scaled_grid_points - scaled_value_cv)
-                    if self.periodic_cvs:
-                        temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                        dist = torch.min(temp_dist, dim=0).values
-                        dist[-1] = dist[0]
-                    add_value = torch.exp(-0.5 * dist * dist / self.cv.scaled_sigma)
-                    self.current_bias = self.current_bias + metad_height * add_value
-                case 2:
-                    simulation_value_cv_x = self.cv_x.measure_cv(self.simulation.pos)
-                    simulation_value_cv_y = self.cv_y.measure_cv(self.simulation.pos)
-                    simulation_cv_energy = self.simulation.sys.cv_force.calc_energy(self.simulation.pos).detach()
-
-                    metad_height = self.initial_height * torch.exp(-simulation_cv_energy / (self.delta_temperature * constants.BOLTZMANN))
-
-                    cv_add_values = []
-                    for idx, simulation_value_cv in enumerate((simulation_value_cv_x, simulation_value_cv_y)):
-                        scaled_value_cv = (simulation_value_cv - self.cvs[idx].min_value) / self.cvs[idx].box
-                        if self.periodic_cvs:
-                            scaled_value_cv = scaled_value_cv % 1.0
-                        dist = torch.abs(self.cvs[idx].scaled_grid_points - scaled_value_cv)
-                        if self.periodic_cvs:
-                            temp_dist = torch.stack((dist, torch.abs(dist - 1)))
-                            dist = torch.min(temp_dist, dim=0).values
-                            dist[-1] = dist[0]
-                        add_value = torch.exp(-0.5 * dist * dist / self.cvs[idx].scaled_sigma)
-                        cv_add_values.append(add_value)
-                    # Reverse order to match OpenMM's reduce(np.multiply.outer, reversed(axisGaussians))
-                    add_values_xy = torch.outer(cv_add_values[1], cv_add_values[0]).T
-                    self.current_bias = self.current_bias + metad_height * add_values_xy
-                case _:
-                    raise NotImplementedError("More than two collective variables are currently not implemented")
-            self.simulation.sys.cv_force.update_data_tensor(self.current_bias.detach())
-            self.current_bias.detach_()
+# Append completion to log
+with open(stats_log_file, 'a') as f:
+    f.write("\n" + "=" * 80 + "\n")
+    f.write("SIMULATION COMPLETED\n")
+    f.write(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Total steps: {config['n_steps']}\n")
+    f.write(f"Total frames saved: {n_outputs}\n")

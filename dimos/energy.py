@@ -387,7 +387,7 @@ import torch
 import math
 from warnings import warn
 
-from dimos.utils import get_distances_edge_list, get_distance_vectors, get_dihedral_angle
+from dimos.utils import get_distances_edge_list, get_distance_vectors, get_dihedral_angle, get_dihedral_angle_nd
 from dimos.splines import TwoDimensionalSpline
 from dimos.ewald import Ewald, PME
 from dimos import constants
@@ -521,7 +521,6 @@ class NonbondedLennardJonesCG(CommonNonBonded):
             mask_exclusions = self.filter_applies_to[neighborlist[0], neighborlist[1]]
             neighborlist = neighborlist.T[~mask_exclusions].T
 
-        #print("NBLJ", torch.prod(self.box).item())
         distance_matrix = get_distances_edge_list(
             pos, neighborlist, self.periodic, self.box)
         within_cutoff = distance_matrix <= self.cutoff
@@ -663,7 +662,6 @@ class NonbondedCutoffCommon(CommonNonBonded):
         torch.Tensor
             Total nonbonded energy (Lennard-Jones + electrostatics)
         """
-        #print("NBCUTCOMM", torch.prod(self.box).item())
         distance_matrix = get_distances_edge_list(
             pos, neighborlist, self.periodic, self.box)
         within_cutoff = distance_matrix <= self.cutoff
@@ -677,7 +675,7 @@ class NonbondedCutoffCommon(CommonNonBonded):
 
         electrostatics_energy = self.electrostatics_energy_contrib.calc_energy(
             pos, inverse_distance_cut, distance_matrix_cut, neighborlist_within_cutoff)
-
+        
         return lj_energy + electrostatics_energy
     
     def update_box(self, box):
@@ -870,7 +868,8 @@ class NonbondedInteractionsEwald(NonbondedCutoffCommon):
             dihedral_exclusions: torch.Tensor,
             periodic: bool,
             box: torch.Tensor,
-            method="PME") -> None:
+            method="PME",
+            batch_size=1) -> None:
         """Initialize nonbonded interactions with Ewald summation.
 
         Parameters
@@ -910,13 +909,17 @@ class NonbondedInteractionsEwald(NonbondedCutoffCommon):
         """
         super().__init__(sigmas, epsilons, sigmas_adjust, epsilons_adjust, adjust_list, cutoff, switch_distance, scnb, dihedral_exclusions, periodic, box)
 
+        self.tolerance = tolerance
+        self.all_exclusions = all_exclusions
+        self.dihedral_exclusions = dihedral_exclusions
+
         match method:
             case "Ewald":
                 self.electrostatics_energy_contrib = Ewald(
-                    charges, tolerance, cutoff, scee, all_exclusions, dihedral_exclusions, periodic, box)
+                    charges, tolerance, cutoff, scee, all_exclusions, dihedral_exclusions, periodic, box, batch_size=batch_size)
             case "PME":
                 self.electrostatics_energy_contrib = PME(
-                    charges, tolerance, cutoff, scee, all_exclusions, dihedral_exclusions, periodic, box)
+                    charges, tolerance, cutoff, scee, all_exclusions, dihedral_exclusions, periodic, box, batch_size=batch_size)
 
     def __str__(self):
         """Return name of potential.
@@ -1106,11 +1109,14 @@ class LennardJonesExplicitOneFour(CommonNonBonded):
         interaction_strength = aa * rinv12 - bb * rinv6
 
         if self.switch_dist is not None:
-            mask = distance_matrix_cut > self.switch_dist
-            t = (distance_matrix_cut[mask] - self.switch_dist) / \
-                (self.cutoff - self.switch_dist)
-            switch_val = 1 + t * t * t * (-10 + t * (15 - t * 6))
-            interaction_strength[mask] = interaction_strength[mask] * switch_val
+            t = (distance_matrix_cut - self.switch_dist) / (self.cutoff - self.switch_dist)
+            switch_val = torch.where(
+                t > 0,
+                1 + t * t * t * (-10 + t * (15 - t * 6)),
+                torch.ones_like(t)
+            )
+            interaction_strength = interaction_strength * switch_val
+
         return torch.sum(interaction_strength)
 
     def lj_energy_contribution_cut_one_four(self, pos: torch.Tensor) -> torch.Tensor:
@@ -1131,7 +1137,7 @@ class LennardJonesExplicitOneFour(CommonNonBonded):
         """
         distance_matrix = get_distances_edge_list(
             pos, self.exclusions_one_four, self.periodic, self.box)
-        mask_from_cutoff = [distance_matrix <= self.cutoff]
+        mask_from_cutoff = distance_matrix <= self.cutoff
         distance_matrix = distance_matrix[mask_from_cutoff]
         inverse_dist = 1 / distance_matrix
 
@@ -1359,7 +1365,7 @@ class LennardJones(CommonNonBonded):
         """
         distance_matrix = get_distances_edge_list(
             pos, self.exclusions_one_four, self.periodic, self.box)
-        mask_from_cutoff = [distance_matrix <= self.cutoff]
+        mask_from_cutoff = distance_matrix <= self.cutoff
         distance_matrix = distance_matrix[mask_from_cutoff]
         inverse_dist = 1 / distance_matrix
 
@@ -1509,6 +1515,8 @@ class ElectrostaticsCutoff(CommonNonBonded):
         self.box = box
         self.cutoff = cutoff
         self.exlusions_one_four_no_improper = exlusions_one_four_no_improper
+        self.scee = scee
+        self.solvent_dielectric = solvent_dielectric
 
         if self.exlusions_one_four_no_improper.size(0) > 0:
             self.one_four_charges = self.charges[self.exlusions_one_four_no_improper[0]] * self.charges[self.exlusions_one_four_no_improper[1]] / scee
@@ -1651,7 +1659,8 @@ class NonbondedInteractionsNoCutoff(CommonNonBonded):
             exclusions_one_four: torch.Tensor,
             all_exclusions,
             periodic: bool,
-            box: torch.Tensor) -> None:
+            box: torch.Tensor,
+            upper_triangle: torch.Tensor = None) -> None:
         """
         Initialize the NonbondedInteractionsNoCutoff class.
 
@@ -1675,11 +1684,17 @@ class NonbondedInteractionsNoCutoff(CommonNonBonded):
             Whether the system is periodic.
         box : torch.Tensor
             Dimensions of the simulation box.
+        upper_triangle : torch.Tensor, optional
+            Pre-computed upper triangle indices. If None, computed from sigmas.size(0).
+            For batched systems, this should be block-diagonal indices.
         """
         self.periodic = periodic
         self.box = box
 
-        self.upper_triangle = torch.triu_indices(sigmas.size(0), sigmas.size(0), offset=1)
+        if upper_triangle is None:
+            self.upper_triangle = torch.triu_indices(sigmas.size(0), sigmas.size(0), offset=1)
+        else:
+            self.upper_triangle = upper_triangle
 
         self.lj_energy_contrib = LennardJonesNoCutoff(
             sigmas, epsilons, scnb, exclusions_one_four, all_exclusions, self.upper_triangle, periodic, box)
@@ -1713,7 +1728,6 @@ class NonbondedInteractionsNoCutoff(CommonNonBonded):
         torch.Tensor
             Total nonbonded energy of the system.
         """
-        #print("NBNOCUT", torch.prod(self.box).item())
         distance_matrix = get_distances_edge_list(pos, self.upper_triangle, self.periodic, self.box)
         inverse_distance = 1.0 / distance_matrix
 
@@ -2531,6 +2545,7 @@ class Torsion(CommonBonded):
 
         angle_diff = self.torsion_parameters[:, 1] * phi - self.torsion_parameters[:, 2]
         energy_contrib = self.torsion_parameters[:, 0] * (1 + torch.cos(angle_diff))
+
         return torch.sum(energy_contrib)
 
 ### Corrections ###
@@ -2693,5 +2708,4 @@ class DispersionCorrection(CommonBonded):
         torch.Tensor
             The dispersion correction energy scaled by system volume
         """
-        #print("DISPERS", torch.prod(self.box).item())
         return self.dispersion_energy / torch.prod(self.box)

@@ -392,7 +392,7 @@ from warnings import warn
 
 from dimos.energy import NonbondedInteractionsEwald, NonbondedInteractionsCutoff, NonbondedInteractionsNoCutoff, HarmonicBond, HarmonicAngle, Torsion, CHARMMTorsion, DispersionCorrection, CmapCorrection
 from dimos.constraints import ConstraintsHandling, PassthroughConstraintHandling
-from dimos.utils import measure_temperature, periodic_correction
+from dimos.utils import measure_temperature, periodic_correction, netCDF_file_wrapper
 from dimos import constants
 
 # Nonbonded-types: Cutoff, NoCutoff, Ewald, PME
@@ -434,7 +434,7 @@ class MinimalSystem():
         Whether to create computation graphs
     """
 
-    def __init__(self, unit_system="amber", create_graph=False, dtype=None):
+    def __init__(self, unit_system="amber", create_graph=False, dtype=None, dim=3):
         if dtype is None:
             dtype = torch.get_default_dtype()
         self.dtype = dtype
@@ -449,6 +449,8 @@ class MinimalSystem():
         self.nonbonded_force_components = []
         self.bonded_force_components = []
         self.create_graph = create_graph
+
+        self.dim=dim
 
     def apply_boundary_conditions(self, pos: torch.Tensor) -> torch.Tensor:
         """
@@ -614,10 +616,10 @@ class ClassicalParmedForceField(MinimalSystem):
         Cutoff distance
     switch_distance : float
         Switching distance
-    pdb_writer : parmed.formats.pdb.PDBFile
-        PDB file writer
-    pdb_counter : int
-        Counter for PDB files
+    config_writer : parmed.formats.pdbx.PDBxFile or parmed.formats.pdb.PDBFile
+        Config file writer
+    config_counter : int
+        Counter for configuration output files
     cv_force : None
         Placeholder for collective variable force
     """
@@ -634,6 +636,7 @@ class ClassicalParmedForceField(MinimalSystem):
             unit_system="amber",
             constraint_option=None,
             periodic=None,
+            file_format="pdb",
             create_graph=False,
             dtype=None):
         """
@@ -665,11 +668,19 @@ class ClassicalParmedForceField(MinimalSystem):
         self.cutoff = cutoff
         self.switch_distance = switch_distance
 
-        self.pdb_writer = parmed.formats.pdb.PDBFile("")
-        self.pdb_counter = 0
+        match file_format:
+            case "cif":
+                self.config_writer = parmed.formats.CIFFile()
+            case "pdb":
+                self.config_writer = parmed.formats.pdb.PDBFile("")
+            case "netcdf":
+                self.config_writer = netCDF_file_wrapper()
+            case _:
+                raise ValueError(f"File format {file_format} not supported for config writer!")
+        self.config_counter = 0
+
 
         self.cv_force = None
-
         self.set_box(parameter_set_parmed, periodic, nonbonded_type)
 
         # Add bonded energy contributions
@@ -964,6 +975,26 @@ class ClassicalParmedForceField(MinimalSystem):
                 self.other_molecules.append(torch.tensor(list(mol)))
         self.length3_molecules = torch.tensor(length3_molecules)
 
+        # Build bond adjacency list for bond-graph-based unwrapping
+        self._build_bond_adjacency(parameter_set_parmed)
+
+    def _build_bond_adjacency(self, parameter_set_parmed):
+        """
+        Build bond adjacency list for molecule unwrapping.
+
+        Creates a list where each entry contains the indices of atoms
+        bonded to the atom at that index.
+
+        Parameters
+        ----------
+        parameter_set_parmed : parmed.Structure
+            ParmEd structure containing force field parameters.
+        """
+        self.bond_adjacency = [[] for _ in range(self.num_atoms)]
+        for bond in parameter_set_parmed.bonds:
+            self.bond_adjacency[bond.atom1.idx].append(bond.atom2.idx)
+            self.bond_adjacency[bond.atom2.idx].append(bond.atom1.idx)
+
     def check_generic_adjusts(self, dihedrals_parameters):
         """
         Check for consistent scaling factors in dihedral parameters.
@@ -1221,7 +1252,117 @@ class ClassicalParmedForceField(MinimalSystem):
         """
         raise NotImplementedError("Dihedral reading is different for Gromacs and Amber and needs to be implemented in subclass")
 
-    def write_pdb(self, positions, output, unwrap=True):
+    def write_pdb(self, positions, output, unwrap=True, box=None, unwrap_method="bond"):
+        self.write_config(positions, output, unwrap, box, unwrap_method)
+
+    def _unwrap_molecule_bond_walk(self, positions, atom_indices, box):
+        """
+        Unwrap a molecule using bond-graph walking (like Gromacs/OpenMM).
+
+        Walks through the bond graph starting from the first atom,
+        placing each bonded atom at the minimum image distance from
+        its already-placed neighbor.
+
+        Parameters
+        ----------
+        positions : torch.Tensor
+            The positions tensor (modified in place).
+        atom_indices : list or torch.Tensor
+            Indices of atoms in this molecule.
+        box : torch.Tensor
+            Box dimensions.
+        """
+        if len(atom_indices) <= 1:
+            return
+
+        atom_set = set(atom_indices.tolist() if torch.is_tensor(atom_indices) else atom_indices)
+        visited = set()
+        stack = [atom_indices[0] if torch.is_tensor(atom_indices) else atom_indices[0]]
+        if torch.is_tensor(stack[0]):
+            stack[0] = stack[0].item()
+        visited.add(stack[0])
+
+        while stack:
+            current = stack.pop()
+            current_pos = positions[current]
+
+            for neighbor in self.bond_adjacency[current]:
+                if neighbor in visited or neighbor not in atom_set:
+                    continue
+
+                # Place neighbor at minimum image distance from current atom
+                delta = positions[neighbor] - current_pos
+                delta = delta - box * torch.round(delta / box)
+                positions[neighbor] = current_pos + delta
+
+                visited.add(neighbor)
+                stack.append(neighbor)
+
+    def _unwrap_molecules_geometry(self, local_positions, box):
+        """
+        Unwrap molecules using geometric circular mean method.
+
+        Uses circular statistics to compute the mean position of each molecule,
+        then places atoms relative to that center using minimum image convention.
+
+        Parameters
+        ----------
+        local_positions : torch.Tensor
+            The positions tensor (modified in place).
+        box : torch.Tensor
+            Box dimensions.
+        """
+        def mean_position(positions, box):
+            position_angles = 2.0 * torch.pi * positions / box.unsqueeze(0).unsqueeze(0)
+            cosine_avg = torch.mean(torch.cos(position_angles), dim=1)
+            sine_avg = torch.mean(torch.sin(position_angles), dim=1)
+            theta_avg = torch.arctan2(sine_avg, cosine_avg)
+            return (theta_avg * box / (2.0 * torch.pi)) % box
+
+        if hasattr(self, "length3_molecules") and self.length3_molecules.numel() > 0:
+            water_positions = local_positions[self.length3_molecules]
+            water_centers = mean_position(water_positions, box).unsqueeze(1)
+            offset = periodic_correction(water_positions - water_centers, box)
+            local_positions[self.length3_molecules] = water_centers + offset
+
+        if hasattr(self, "other_molecules"):
+            for mol in self.other_molecules:
+                molecule_positions = local_positions[mol]
+                molecule_center = mean_position(molecule_positions.unsqueeze(0), box).squeeze(0)
+                offset = periodic_correction(molecule_positions - molecule_center, box)
+                local_positions[mol] = molecule_center + offset
+
+    def _unwrap_molecules_bond(self, local_positions, box):
+        """
+        Unwrap molecules using bond-graph walking method (like Gromacs/OpenMM).
+
+        Walks through the bond graph and places each bonded atom at the
+        minimum image distance from its already-placed neighbor.
+
+        Parameters
+        ----------
+        local_positions : torch.Tensor
+            The positions tensor (modified in place).
+        box : torch.Tensor
+            Box dimensions.
+        """
+        # For 3-atom molecules (typically water), use vectorized approach for efficiency
+        if hasattr(self, "length3_molecules") and self.length3_molecules.numel() > 0:
+            # For water molecules: anchor to first atom, place others relative to it
+            water_indices = self.length3_molecules  # Shape: (n_waters, 3)
+            anchor_pos = local_positions[water_indices[:, 0]]  # First atom of each water
+
+            for i in [1, 2]:
+                delta = local_positions[water_indices[:, i]] - anchor_pos
+                delta = delta - box * torch.round(delta / box)
+                local_positions[water_indices[:, i]] = anchor_pos + delta
+
+        # For other molecules, use explicit bond-graph walking
+        if hasattr(self, "other_molecules"):
+            for mol in self.other_molecules:
+                self._unwrap_molecule_bond_walk(local_positions, mol, box)
+
+    def write_config(self, positions, output, unwrap=True, box=None, unwrap_method="bond"):
         """
         Write the positions to a PDB file.
 
@@ -1233,37 +1374,42 @@ class ClassicalParmedForceField(MinimalSystem):
             The output file or file path.
         unwrap : bool, optional
             Whether to unwrap molecules across periodic boundaries (default is True).
+        box : torch.Tensor, optional
+            Box dimensions. If None, uses self.box.
+        unwrap_method : str, optional
+            Method for unwrapping molecules. Options are:
+            - "bond": Use bond-graph walking (like Gromacs/OpenMM). More robust for
+              complex molecules. Requires bond topology. (default)
+            - "geometry": Use geometric circular mean. Faster but may fail for
+              molecules spanning more than half the box or unusual shapes.
         """
-        def mean_position(positions, box):
-            position_angles = 2.0 * torch.pi * positions / box.unsqueeze(0).unsqueeze(0)
-            cosine_avg = torch.mean(torch.cos(position_angles), dim=1)
-            sine_avg = torch.mean(torch.sin(position_angles), dim=1)
-            theta_avg = torch.arctan2(sine_avg, cosine_avg)
-            return (theta_avg * box / (2.0 * torch.pi)) % box
-        
         local_positions = torch.empty_like(positions).copy_(positions)
+        if box is None:
+            box = self.box
 
         if isinstance(output, str):
             output_file = open(output, "a")
         else:
             output_file = output
 
-        if unwrap and self.box is not None and hasattr(self, "length3_molecules") and hasattr(self, "other_molecules"):
-            water_positions = local_positions[self.length3_molecules]
-            water_centers = mean_position(water_positions, self.box).unsqueeze(1)
-            offset = periodic_correction(water_positions - water_centers, self.box)
-            local_positions[self.length3_molecules] = water_centers + offset
+        if unwrap and box is not None:
+            if unwrap_method == "bond":
+                if hasattr(self, "bond_adjacency"):
+                    self._unwrap_molecules_bond(local_positions, box)
+                else:
+                    warn("Bond adjacency not available, falling back to geometry-based unwrapping.", stacklevel=2)
+                    self._unwrap_molecules_geometry(local_positions, box)
+            elif unwrap_method == "geometry":
+                self._unwrap_molecules_geometry(local_positions, box)
+            else:
+                raise ValueError(f"Unknown unwrap_method '{unwrap_method}'. Use 'bond' or 'geometry'.")
 
-            for mol in self.other_molecules:
-                molecule_positions = local_positions[mol]
-                molecule_center = mean_position(molecule_positions.unsqueeze(0), self.box).squeeze(0)
-                offset = periodic_correction(molecule_positions - molecule_center, self.box)
-                local_positions[mol] = molecule_center + offset
-
-        output_file.write('MODEL      %5d\n' % (self.pdb_counter + 1))
-        self.pdb_writer.write(self.parameter_set_parmed, output_file, coordinates=local_positions.to(torch.device("cpu")).detach().numpy())
-        output_file.write('ENDMDL\n')
-        self.pdb_counter += 1
+        if isinstance(self.config_writer, parmed.formats.pdb.PDBFile):
+            output_file.write('MODEL     %4d\n' % (self.config_counter + 1))
+        self.config_writer.write(self.parameter_set_parmed, output_file, coordinates=local_positions.to(torch.device("cpu")).detach().numpy())
+        if isinstance(self.config_writer, parmed.formats.pdb.PDBFile):
+            output_file.write('ENDMDL\n')
+        self.config_counter += 1
 
     def as_mace_system(self, mace_name, enable_cueq=True, atom_range=None):
         """
@@ -1506,7 +1652,7 @@ class GromacsForceField(ClassicalParmedForceField):
             CHARMM = True
             for improper in parameter_set.impropers:
                 temp_improper_list.append([improper.atom1.idx, improper.atom2.idx, improper.atom3.idx, improper.atom4.idx])
-                temp_improper_parameter_list.append([improper.type.psi_k, improper.type.psi_eq])
+                temp_improper_parameter_list.append([improper.type.psi_k, math.radians(improper.type.psi_eq)])
 
         dihedrals = torch.tensor(temp_dihedral_list)
         impropers = torch.tensor(temp_improper_list)

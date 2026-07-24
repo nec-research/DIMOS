@@ -434,7 +434,7 @@ class Simulation():
         """
         raise NotImplementedError("Step needs to be implemented by the respective simulations.")
 
-    def measure_potential_energy(self):
+    def measure_potential_energy(self, cached=True):
         """
         Calculate the potential energy of the current configuration.
         
@@ -443,8 +443,15 @@ class Simulation():
         torch.Tensor
             The potential energy of the system.
         """
-        self.neighborlist = self.neighbor_handling.check_recalc(self.pos)
-        return self.sys.calc_energy(self.pos, self.neighborlist)
+        if cached and hasattr(self.integrator,"e") and self.integrator.e is not None:
+            # TODO: Add check to see if cashed energy is correct!
+            return self.integrator.e
+        else:
+            if hasattr(self, 'neighbor_handling') and self.neighbor_handling is not None:
+                self.neighborlist = self.neighbor_handling.check_recalc(self.pos)
+            else:
+                self.neighborlist = None
+            return self.sys.calc_energy(self.pos, self.neighborlist)
 
     def minimize_energy(self, num_optim, print_details=False, optimizer="LBFGS"):
         """
@@ -656,8 +663,6 @@ class MDSimulation(Simulation):
 
             if detach:
                 self.detach_()
-                self.neighbor_handling.original_pos.detach_()
-                self.neighbor_handling.box.detach_()
 
             self.total_step_counter = self.total_step_counter + 1
 
@@ -675,7 +680,10 @@ class MDSimulation(Simulation):
         """
         self.integrator.detach_()
         self.vel.detach_()
-        self.pos.detach_().requires_grad_()
+        self.pos = self.pos.detach().contiguous().requires_grad_()
+        if self.sys.use_neighborlist:
+            self.neighbor_handling.original_pos.detach_()
+            self.neighbor_handling.box.detach_()
 
     def update_box(self, box):
         """
@@ -689,7 +697,8 @@ class MDSimulation(Simulation):
         box : torch.Tensor
             The new box dimensions.
         """
-        self.neighbor_handling.update_box(box)
+        if self.sys.use_neighborlist:
+            self.neighbor_handling.update_box(box)
         self.integrator.update_box(box)
         self.sys.update_box(box)
 
@@ -853,5 +862,4 @@ class MCSimulation(Simulation):
         for move in self.move_set:
             if hasattr(move, "integrator"):
                 move.integrator.detach_()
-        self.pos.detach_()
-        self.pos.requires_grad_()
+        self.pos = self.pos.detach().contiguous().requires_grad_()

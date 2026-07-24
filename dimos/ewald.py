@@ -471,7 +471,8 @@ class CommonEwald(CommonNonBonded):
             all_exclusions_without_improper,
             dihedral_exclusions,
             periodic: bool,
-            box: torch.Tensor):
+            box: torch.Tensor,
+            batch_size=1):
         """
         Initialize the CommonEwald class.
 
@@ -501,6 +502,8 @@ class CommonEwald(CommonNonBonded):
         self.tolerance = tolerance
         self.all_exclusions = all_exclusions_without_improper
         self.dihedral_exclusions = dihedral_exclusions
+
+        self.batch_size = batch_size
 
         if self.dihedral_exclusions.size(0) > 0:
             self.one_four_charges = self.charges[self.dihedral_exclusions[0]] * self.charges[self.dihedral_exclusions[1]] / scee
@@ -658,11 +661,21 @@ class CommonEwald(CommonNonBonded):
         torch.Tensor
             Total Ewald energy.
         """
-        ewald_energy = self.ewald_direct(inverse_distance_cut, distance_matrix_cut, neighborlist)
-        ewald_energy = ewald_energy + self.ewald_reciprocal(pos)
-        ewald_energy = ewald_energy + self.ewald_self_energy
-        ewald_energy = ewald_energy + self.ewald_exclusions(pos)
-        one_four_energy = self.electrostatic_energy_contribution_one_four(pos)
+
+        if self.batch_size == 1:
+            ewald_energy = self.ewald_direct(inverse_distance_cut, distance_matrix_cut, neighborlist)
+            ewald_energy = ewald_energy + self.ewald_reciprocal(pos, self.charges)
+            ewald_energy = ewald_energy + self.ewald_self_energy
+            ewald_energy = ewald_energy + self.ewald_exclusions(pos)
+            one_four_energy = self.electrostatic_energy_contribution_one_four(pos)
+        else:
+            ewald_energy = self.ewald_direct(inverse_distance_cut, distance_matrix_cut, neighborlist)
+            ewald_energy = ewald_energy + torch.vmap(self.ewald_reciprocal)(pos.view(self.batch_size,-1,3), self.charges.view(self.batch_size,-1)).sum() #TODO: This is specific to d=3!!! But Ewald currently anyway is, so no biggy :D BUT!!! This assumes the same number of atoms!!!
+            ewald_energy = ewald_energy + self.ewald_self_energy
+            ewald_energy = ewald_energy + self.ewald_exclusions(pos)
+            one_four_energy = self.electrostatic_energy_contribution_one_four(pos)
+            
+        
         return ewald_energy + one_four_energy
 
 
@@ -806,7 +819,8 @@ class Ewald(CommonEwald):
             dihedral_exclusions,
             periodic: bool,
             box: torch.Tensor,
-            k_space_use_sphere: bool = False) -> None:
+            k_space_use_sphere: bool = False,
+            batch_size = 1) -> None:
         """
         Initialize the Ewald class.
 
@@ -831,7 +845,7 @@ class Ewald(CommonEwald):
         k_space_use_sphere : bool, optional
             Whether to use a spherical cutoff in k-space. Default is False.
         """
-        super().__init__(charges, tolerance, scee, all_exclusions_without_improper, dihedral_exclusions, periodic, box)
+        super().__init__(charges, tolerance, scee, all_exclusions_without_improper, dihedral_exclusions, periodic, box, batch_size=batch_size)
 
         self.sqrt_pi = math.sqrt(math.pi)
         self.two_pi = 2 * torch.pi
@@ -898,7 +912,7 @@ class Ewald(CommonEwald):
 
         self.norm = self.two_pi * constants.ONE_BY_4_PI_EPSILON_0 / torch.prod(self.box)
 
-    def ewald_reciprocal(self, pos: torch.Tensor) -> torch.Tensor:
+    def ewald_reciprocal(self, pos: torch.Tensor, charges) -> torch.Tensor:
         """
         Calculate the Ewald reciprocal space energy.
         
@@ -915,16 +929,12 @@ class Ewald(CommonEwald):
         torch.Tensor
             Ewald reciprocal space energy.
         """
-        # kr has shape: n_atoms x k_max
         kr = torch.einsum('ai, ki -> ak', pos, self.k_meshgrid)
 
-        # real and imaginary parts of the structure factor have shape: k_max
-        structure_factor_real = torch.sum(self.charges.unsqueeze(-1) * torch.cos(kr), dim=0)
-        structure_factor_imag = torch.sum(self.charges.unsqueeze(-1) * torch.sin(kr), dim=0)
+        structure_factor_real = torch.sum(charges.unsqueeze(-1) * torch.cos(kr), dim=0)
+        structure_factor_imag = torch.sum(charges.unsqueeze(-1) * torch.sin(kr), dim=0)
 
-        # square of the structure factor has shape: k_max
         sfactor_sq = structure_factor_real ** 2 + structure_factor_imag ** 2
-
         energy_sum = torch.sum(self.k_factor * sfactor_sq * self.sym_factor)
 
         return energy_sum * self.norm
@@ -1009,7 +1019,8 @@ class PME(CommonEwald):
             dihedral_exclusions,
             periodic: bool,
             box: torch.Tensor,
-            order=5):
+            order=5,
+            batch_size=1):
         """
         Initialize the PME class.
 
@@ -1034,7 +1045,7 @@ class PME(CommonEwald):
         order : int, optional
             Order of the B-spline interpolation. Default is 5.
         """
-        super().__init__(charges, tolerance, scee, all_exclusions_without_improper, dihedral_exclusions, periodic, box)
+        super().__init__(charges, tolerance, scee, all_exclusions_without_improper, dihedral_exclusions, periodic, box, batch_size)
         self.order = order
 
         self.alpha = (1.0 / cutoff) * math.sqrt(-math.log(2.0 * self.tolerance))
@@ -1105,7 +1116,7 @@ class PME(CommonEwald):
         BC = C / B
         return BC
 
-    def ewald_reciprocal(self, position):
+    def ewald_reciprocal(self, position, charges):
         """
         Calculate the Ewald reciprocal space energy for PME.
         
@@ -1140,7 +1151,7 @@ class PME(CommonEwald):
         M1 = bspline(fr[:, 0] + _g, self.order).flip(1)
         M2 = bspline(fr[:, 1] + _g, self.order).flip(1)
         M3 = bspline(fr[:, 2] + _g, self.order).flip(1)
-        Q123 = self.charges[:, None, None, None] * (M1[:, :, None, None] * M2[:, None, :, None] * M3[:, None, None, :])
+        Q123 = charges[:, None, None, None] * (M1[:, :, None, None] * M2[:, None, :, None] * M3[:, None, None, :])
 
         x_indices = (idx[:, 0, None] + _g) % self.ngrid[0]
         y_indices = (idx[:, 1, None] + _g) % self.ngrid[1]

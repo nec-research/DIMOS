@@ -488,8 +488,8 @@ class OneDimensionalSpline():
         """
         assert grid.dim() == 1, "Data is not one dimensional"
         length = grid.size(0)
-        self.data = data
-        self.grid = grid
+        self.data = data.contiguous()
+        self.grid = grid.contiguous()
 
         if periodic:
             self.derivative = torch.zeros((length))
@@ -512,12 +512,17 @@ class OneDimensionalSpline():
             alpha = c[-2]
             gamma = -b[0]
 
-            # This is apparently the Sherman-Morrison method method, see OpenMM
+            # Sherman-Morrison method for cyclic tridiagonal system, see OpenMM.
+            # Decompose the cyclic matrix as A = A' + u_vec * v^T where
+            #   u_vec = [gamma, 0, ..., 0, alpha]  and  v = [1, 0, ..., 0, beta/gamma]
+            # Then x = y - (v^T y)/(1 + v^T z) * z  where A'y = rhs and A'z = u_vec.
             length = length - 1
             b[0] = b[0] - gamma
             b[-1] = b[-1] - alpha * beta / gamma
             deriv = self.solve_tridigonal_matrix(a, b, c, rhs)
             u = torch.zeros((length))
+            u[0] = gamma
+            u[-1] = alpha
             z = self.solve_tridigonal_matrix(a, b, c, u)
             scale = (deriv[0] + beta * deriv[-1] / gamma) / (1.0 + z[0] + beta * z[-1] / gamma)
             self.derivative[:-1] = deriv - scale * z
@@ -704,9 +709,9 @@ class TwoDimensionalSpline():
         -------
         None
         """
-        self.grid_x = grid_x
-        self.grid_y = grid_y
-        self.f = f
+        self.grid_x = grid_x.contiguous()
+        self.grid_y = grid_y.contiguous()
+        self.f = f.contiguous()
 
         one_dimensional_spline_handler = OneDimensionalSpline()
 
@@ -817,8 +822,10 @@ class TwoDimensionalSpline():
 
         x_bar = (u - self.grid_x[lower_x]) / (self.grid_x[upper_x] - self.grid_x[lower_x])
         y_bar = (v - self.grid_y[lower_y]) / (self.grid_y[upper_y] - self.grid_y[lower_y])
-        x_bar_vector = torch.tensor([1.0, x_bar, x_bar**2, x_bar**3])
-        y_bar_vector = torch.tensor([1.0, y_bar, y_bar**2, y_bar**3])
+        # Use torch.stack so that gradients flow through x_bar and y_bar into u and v.
+        # torch.tensor([...]) always copies data and severs the autograd graph.
+        x_bar_vector = torch.stack([torch.ones_like(x_bar), x_bar, x_bar**2, x_bar**3])
+        y_bar_vector = torch.stack([torch.ones_like(y_bar), y_bar, y_bar**2, y_bar**3])
 
         value = torch.einsum("ij,i,j->", a, x_bar_vector, y_bar_vector)
 
@@ -857,11 +864,13 @@ class TwoDimensionalSpline():
         delta_y = (self.grid_y[upper_y] - self.grid_y[lower_y])
         y_bar = (v - self.grid_y[lower_y]) / delta_y
 
-        x_bar_vector = torch.tensor([1.0, x_bar, x_bar**2, x_bar**3])
-        y_bar_vector = torch.tensor([1.0, y_bar, y_bar**2, y_bar**3])
+        # Use torch.stack so gradients flow through x_bar / y_bar to u and v.
+        # torch.tensor([...]) always copies and severs the autograd graph.
+        x_bar_vector = torch.stack([torch.ones_like(x_bar), x_bar, x_bar**2, x_bar**3])
+        y_bar_vector = torch.stack([torch.ones_like(y_bar), y_bar, y_bar**2, y_bar**3])
 
-        x_bar_vector_dx = torch.tensor([0.0, 1.0, 2.0 * x_bar, 3.0 * x_bar**2])
-        y_bar_vector_dy = torch.tensor([0.0, 1.0, 2.0 * y_bar, 3.0 * y_bar**2])
+        x_bar_vector_dx = torch.stack([torch.zeros_like(x_bar), torch.ones_like(x_bar), 2.0 * x_bar, 3.0 * x_bar**2])
+        y_bar_vector_dy = torch.stack([torch.zeros_like(y_bar), torch.ones_like(y_bar), 2.0 * y_bar, 3.0 * y_bar**2])
 
         value_x = torch.einsum("ij,i,j->", a, x_bar_vector_dx, y_bar_vector)
         value_y = torch.einsum("ij,i,j->", a, x_bar_vector, y_bar_vector_dy)
@@ -870,7 +879,7 @@ class TwoDimensionalSpline():
         return value_x / delta_x, value_y / delta_y, value_dxdy / delta_x / delta_y
 
 
-class _BSplineFn(torch.autograd.Function):
+class _BSplineFn_old(torch.autograd.Function):
     """
     A class to represent B-spline functions.
 
@@ -990,5 +999,37 @@ class _BSplineFn(torch.autograd.Function):
         """
         return super(_BSplineFn, cls).apply(*args, **kwargs)
 
+
+class _BSplineFn(torch.autograd.Function):
+    # Let PyTorch auto-generate a batch rule for vmap
+    generate_vmap_rule = True  # or implement a custom vmap(...) staticmethod instead
+
+    @staticmethod
+    def triangle(x: torch.Tensor) -> torch.Tensor:
+        # Equivalent to max(1 - |x-1|, 0)
+        return torch.clamp(1.0 - torch.abs(x - 1.0), min=0.0)
+
+    @staticmethod
+    def M(x: torch.Tensor, k: int) -> torch.Tensor:
+        if k <= 2:
+            return _BSplineFn.triangle(x)
+        return (x * _BSplineFn.M(x, k - 1) + (k - x) * _BSplineFn.M(x - 1, k - 1)) / (k - 1)
+
+    # New-style forward without ctx; all context setup goes in setup_context
+    @staticmethod
+    def forward(x: torch.Tensor, k: int) -> torch.Tensor:
+        return _BSplineFn.M(x, k)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, k = inputs
+        ctx.save_for_backward(x)
+        ctx.k = k  # non-Tensor metadata can be saved directly
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x,) = ctx.saved_tensors
+        g = _BSplineFn.M(x, ctx.k - 1) - _BSplineFn.M(x - 1, ctx.k - 1)
+        return g * grad_output, None
 
 bspline = _BSplineFn.apply

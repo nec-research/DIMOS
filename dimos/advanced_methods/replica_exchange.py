@@ -388,16 +388,14 @@ This class enables enhanced sampling by:
 - Periodically attempting exchanges between replicas using the Metropolis criterion
 - Handling position and velocity exchanges with appropriate temperature scaling
 - Supporting both molecular dynamics and Monte Carlo replicas
-
-Note: This is currently an experimental feature and should be used with caution.
 """
 
 import torch
-from warnings import warn
-
 from dimos import constants
 
+from dimos import timer_func
 
+from concurrent.futures import ThreadPoolExecutor
 class ReplicaExchange():
     """
     Class for handling replica exchange molecular dynamics (REMD) simulations.
@@ -427,7 +425,7 @@ class ReplicaExchange():
         Number of exchange attempts per replica exchange step
     """
 
-    def __init__(self, simulations, steps_before_exchange=1, num_exchange_attempts=50):
+    def __init__(self, simulations, steps_before_exchange=1, parallel=True, compile=True, simulations_per_thread=6):
         """
         Initialize the replica exchange simulation.
 
@@ -440,13 +438,35 @@ class ReplicaExchange():
         num_exchange_attempts : int, optional
             Number of exchange attempts per replica exchange step, by default 50
         """
-        warn("Replica Exchange is currently an experimental feature. While it should work mostly correct, it has not been thoroughly tested. Please be careful when using it and compare to established implementations.", stacklevel=2)
         self.simulations = simulations  # simulations is an list of MDSimulations or MCSimulations with different Hamiltonians or temperatures...
         self.steps_before_exchange = steps_before_exchange
         self.num_simulations = len(self.simulations)
-        self.num_exchange_attempts = num_exchange_attempts
+        self.indices = torch.tensor(range(0,self.num_simulations), requires_grad=False)
+        self.attempted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+        self.accepted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
 
-    def step(self, generator=None):
+        if parallel:
+            assert simulations_per_thread < self.num_simulations, "Cannot run simulations with more threads than simulations"
+            self.executor = ThreadPoolExecutor(max_workers=self.num_simulations//simulations_per_thread)
+        else:
+            self.executor = None
+
+        if compile:
+            print("Compiling Replica Exchange step functions")
+            torch._dynamo.config.cache_size_limit = 1_000_000
+            self.step_functions = [torch.compile(simulation.step, mode="max-autotune-no-cudagraphs") for simulation in self.simulations]
+        else:
+            self.step_functions = [simulation.step for simulation in self.simulations]
+        
+        if compile and parallel:
+           torch.set_num_interop_threads(1)
+
+    def reset_acceptance_statistics(self):
+        self.attempted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+        self.accepted_swaps = torch.zeros_like(self.indices[:-1], requires_grad=False)
+
+    #@timer_func
+    def step(self, steps=1, generator=None, detach=True):
         """
         Perform a complete replica exchange step.
 
@@ -468,32 +488,98 @@ class ReplicaExchange():
         the temperature-weighted energy differences between replicas. For temperature
         replicas, velocities are scaled by sqrt(T_new/T_old) during exchanges.
         """
-        # Simulate the specified number of steps and gather the simulations information
-        for simulation in self.simulations:
-            simulation.step(self.steps_before_exchange)
 
-        for _ in range(self.num_exchange_attempts):
-            # Since we are doing exchange attempts between all replica, the order is, as such, not important any longer
-            # When writing out the measured properties, the simulations always stay fixed, since "only" the positions and velocities are exchanged
-            random_indices = (torch.empty(2).uniform_(generator=generator) * (self.num_simulations)).to(torch.int32)
+        acceptance_rates = []
+        for step in range(steps):
+            # Simulate the specified number of steps and gather the simulations information
+            
+            # Do parallel executions either via pyTorch parallelism or Python parallelism
+            if self.executor is None:
+                for step_function in self.step_functions:
+                    step_function(self.steps_before_exchange, detach=detach)
+                # for simulation in self.simulations:
+                #     simulation.step(self.steps_before_exchange)
+            else:
+                num_threads = torch.get_num_threads()
+                torch.set_num_threads(1)
+                futures = [self.executor.submit(step_function, self.steps_before_exchange) for step_function in self.step_functions]
+                #[self.executor.submit(simulation.step, self.steps_before_exchange) for simulation in self.simulations]
+                for future in futures:
+                    future.result()
+                torch.set_num_threads(num_threads)
+            
+            torch.cuda.synchronize()
 
-            simulation_0 = self.simulations[random_indices[0]]
-            simulation_1 = self.simulations[random_indices[1]]
+            even = torch.empty(1).uniform_(generator=generator) > 0.5
+            for index in range(self.num_simulations//2):
+                first_index = 2*index+even
+                second_index = 2*index+even+1
+                if second_index >= self.num_simulations:
+                    continue
 
-            potential_energy_0_0 = simulation_0.sys.calc_energy(simulation_0.pos)
-            potential_energy_0_1 = simulation_0.sys.calc_energy(simulation_1.pos)
+                self.attempted_swaps[first_index] = self.attempted_swaps[first_index] + 1
 
-            potential_energy_1_1 = simulation_1.sys.calc_energy(simulation_1.pos)
-            potential_energy_1_0 = simulation_1.sys.calc_energy(simulation_0.pos)
+                simulation_0 = self.simulations[first_index]
+                simulation_1 = self.simulations[second_index]
 
-            difference = torch.exp((potential_energy_0_0 - potential_energy_0_1) / simulation_0.temperature / constants.BOLTZMANN +
-                                   (potential_energy_1_1 - potential_energy_1_0) / simulation_1.temperature / constants.BOLTZMANN)
+                # TODO: In principle, this could be extracted from the latest force calculation instead of re-doing the computation. Add caching? !!! ???
+                #potential_energy_0_0 = simulation_0.sys.calc_energy(simulation_0.pos, simulation_0.neighborlist)
+                #potential_energy_1_1 = simulation_1.sys.calc_energy(simulation_1.pos, simulation_1.neighborlist)
 
-            if difference > torch.empty(1).uniform_(generator=generator):
-                simulation_0.pos, simulation_1.pos = simulation_1.pos, simulation_0.pos
-                if hasattr(simulation_0, 'vel') and hasattr(simulation_1, 'vel'):
-                    if simulation_0.temperature != simulation_1.temperature:
-                        scaling_factor = torch.sqrt(simulation_1.temperature / simulation_0.temperature)
-                        simulation_0.vel = simulation_0.vel * scaling_factor
-                        simulation_1.vel = simulation_1.vel / scaling_factor
-                    simulation_0.vel, simulation_1.vel = simulation_1.vel, simulation_0.vel
+                potential_energy_0_0 = simulation_0.integrator.e
+                potential_energy_1_1 = simulation_1.integrator.e
+
+                # Return forces of the potentially exchanged configurations to update the acceleration later.
+                potential_energy_0_1, _, acceleration_0_1 = simulation_0.sys.calc_energy(simulation_1.pos, simulation_1.neighborlist, return_forces=True)
+                potential_energy_1_0, _, acceleration_1_0 = simulation_1.sys.calc_energy(simulation_0.pos, simulation_0.neighborlist, return_forces=True)
+
+                delta_energy_temp = (potential_energy_0_0 - potential_energy_0_1) / simulation_0.temperature / constants.BOLTZMANN + (potential_energy_1_1 - potential_energy_1_0) / simulation_1.temperature / constants.BOLTZMANN
+
+                # This is needed for NPT simulations. 
+                # TODO: Need to check the correct sign AND units!!! ???
+                delta_volume = 0.0
+                if simulation_0.barostat is not None and simulation_0.barostat is not None:
+                    delta_volume = (simulation_0.barostat.target_pressure / (constants.BOLTZMANN * simulation_0.barostat.target_pressure) - simulation_1.barostat.target_pressure / (constants.BOLTZMANN * simulation_1.barostat.target_pressure))*(torch.prod(simulation_1.sys.box)-torch.prod(simulation_0.sys.box))
+
+                acceptance_criterion = torch.exp(delta_energy_temp + delta_volume)
+                acceptance_rates.append(acceptance_criterion)
+                #if first_index==0:
+                #    print(acceptance_criterion.item(), potential_energy_0_0.item(), potential_energy_1_1.item(), potential_energy_0_1.item(), potential_energy_1_0.item())
+
+                if acceptance_criterion >= torch.empty(1).uniform_(generator=generator):
+                    self.accepted_swaps[first_index] = self.accepted_swaps[first_index] + 1
+
+                    simulation_0.pos, simulation_1.pos = simulation_1.pos, simulation_0.pos
+                    simulation_0.neighborlist, simulation_1.neighborlist = simulation_1.neighborlist, simulation_0.neighborlist
+
+                    temp_index = self.indices[first_index].clone()
+                    self.indices[first_index] = self.indices[second_index]
+                    self.indices[second_index] = temp_index
+                    
+                    if hasattr(simulation_0, 'vel') and hasattr(simulation_1, 'vel'):
+                        simulation_0.vel, simulation_1.vel = simulation_1.vel, simulation_0.vel
+                        
+                        if simulation_0.temperature != simulation_1.temperature:
+                            scaling_factor = (simulation_1.temperature / simulation_0.temperature)**0.5
+                            simulation_0.vel = simulation_0.vel / scaling_factor
+                            simulation_1.vel = simulation_1.vel * scaling_factor
+
+                    if hasattr(simulation_0.integrator, 'a') and hasattr(simulation_1.integrator, 'a'):
+                        simulation_0.integrator.a, simulation_1.integrator.a = acceleration_0_1, acceleration_1_0
+
+                    if not torch.equal(simulation_0.sys.box[:3], simulation_1.sys.box[:3]): #TODO: Not sure if :3 is a good hack or not!!!
+                        print("Different box") # TODO: Check this!!!
+                        simulation_0_box = simulation_0.sys.box
+                        simulation_1_box = simulation_1.sys.box
+
+                        simulation_0.update_box(simulation_1_box)
+                        simulation_1.update_box(simulation_0_box)
+
+            if detach:
+                for simulation in self.simulations:
+                    simulation.detach_()
+
+        return acceptance_rates
+            # self.indices.detach_()
+            # self.attempted_swaps.detach_()
+            # self.accepted_swaps.detach_()

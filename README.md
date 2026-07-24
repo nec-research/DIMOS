@@ -10,7 +10,7 @@ Please cite our paper if you are using DIMOS:
 H. Christiansen, T. Maruyama, F. Errica, V. Zaverkin, M. Takamoto, and F. Alesiani, Fast, Modular, and Differentiable Framework for Machine Learning-Enhanced Molecular Simulations, J. Chem. Phys. 163, 182501 (2025).
 
 For convenience, you may also use the following bibtex entry:
-```bash
+```bibtex
 @article{10.1063/5.0277356,
     author = {Christiansen, Henrik and Maruyama, Takashi and Errica, Federico and Zaverkin, Viktor and Takamoto, Makoto and Alesiani, Francesco},
     title = {Fast, modular, and differentiable framework for machine learning-enhanced molecular simulations},
@@ -22,6 +22,9 @@ For convenience, you may also use the following bibtex entry:
 }
 ```
 
+If you are using the batching or hyperspatial capabilies, please cite (to be replaced with arXiv/published version when available):
+
+H. Christiansen, M. Ferraz, T. Maruyama, and F. Alesiani, Hyperspatial Sampling: Circumventing Free-Energy Barriers via Replica Exchange with Extra Dimensions, [https://henrik-christiansen.de/Paper/HSREX.pdf](https://henrik-christiansen.de/Paper/HSREX.pdf).
 
 ## Installation
 
