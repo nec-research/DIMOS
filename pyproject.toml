@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["dimos-torch"]
+py-modules = ["dimos"]
 
 [project]
 name = "dimos-torch"
@@ -28,6 +28,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.11.0",
     "ParmEd>=4.2.1",
+    "numpy",
 ]
 
 [project.optional-dependencies]
