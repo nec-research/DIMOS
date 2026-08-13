@@ -407,7 +407,7 @@ from dimos.batching import MultiSim
 import dimos.advanced_methods.batched_replica_exchange as brex
 import dimos.advanced_methods.replica_exchange as rex
 
-torch.set_default_device("cuda:3")
+torch.set_default_device("cuda:0")
 torch.set_default_dtype(torch.float64)
 
 # =============================================================================
